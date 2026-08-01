@@ -20,6 +20,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY app/repair_service.py /app/repair_service.py
+COPY app/ /app/
+
+EXPOSE 8080
 
 ENTRYPOINT ["python3", "/app/repair_service.py"]

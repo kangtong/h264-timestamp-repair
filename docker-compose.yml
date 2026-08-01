@@ -2,7 +2,7 @@ services:
   h264-timestamp-repair:
     build:
       context: .
-    image: local/h264-timestamp-repair:1.0.0
+    image: local/h264-timestamp-repair:1.1.0
     container_name: h264-timestamp-repair
     restart: unless-stopped
     environment:
@@ -19,6 +19,14 @@ services:
       MINIMUM_PACKETS: ${MINIMUM_PACKETS:-60}
       RETRY_FAILED_AFTER_SECONDS: ${RETRY_FAILED_AFTER_SECONDS:-86400}
       KEEP_TEMP_ON_FAILURE: ${KEEP_TEMP_ON_FAILURE:-false}
+      WEB_UI_ENABLED: ${WEB_UI_ENABLED:-true}
+      WEB_UI_HOST: 0.0.0.0
+      WEB_UI_PORT: 8080
+      WEB_USERNAME: "${WEB_USERNAME:-admin}"
+      WEB_PASSWORD: "${WEB_PASSWORD:-}"
+      WEB_SHOW_FULL_PATHS: ${WEB_SHOW_FULL_PATHS:-false}
+    ports:
+      - "${WEB_UI_BIND_ADDRESS:-0.0.0.0}:${WEB_UI_HOST_PORT:-8080}:8080"
     volumes:
       - ${MEDIA_HOST_PATH:?Set MEDIA_HOST_PATH in .env}:/media:rw
       - ./config:/config:rw

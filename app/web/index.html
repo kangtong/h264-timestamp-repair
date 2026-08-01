@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>H.264 Timestamp Repair</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">VIDEO INTEGRITY DASHBOARD</p>
+        <h1>H.264 Timestamp Repair</h1>
+        <p class="subtitle">合成时间戳检测与无损修复状态</p>
+      </div>
+      <div class="header-actions">
+        <span id="service-state" class="state-pill neutral"><span class="state-dot"></span>正在连接</span>
+        <button id="refresh-button" class="button secondary" type="button">立即刷新</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="summary-grid" aria-label="状态汇总">
+        <article class="summary-card accent-blue"><span>已扫描</span><strong id="count-total">—</strong><small>MP4 文件</small></article>
+        <article class="summary-card accent-amber"><span>待修复</span><strong id="count-candidate">—</strong><small>Candidate</small></article>
+        <article class="summary-card accent-green"><span>已修复</span><strong id="count-repaired">—</strong><small>Repaired</small></article>
+        <article class="summary-card accent-red"><span>失败</span><strong id="count-failed">—</strong><small>Failed</small></article>
+      </section>
+
+      <section class="panel progress-panel">
+        <div class="panel-heading">
+          <div><p class="section-kicker">CURRENT CYCLE</p><h2>扫描进度</h2></div>
+          <span id="mode-pill" class="mode-pill">—</span>
+        </div>
+        <div class="progress-track" aria-label="当前扫描进度"><div id="progress-bar" class="progress-bar"></div></div>
+        <div class="progress-meta">
+          <div><span>进度</span><strong id="progress-text">等待状态</strong></div>
+          <div><span>当前文件</span><strong id="current-file">—</strong></div>
+          <div><span>上次心跳</span><strong id="heartbeat-age">—</strong></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading table-heading">
+          <div><p class="section-kicker">MEDIA STATUS</p><h2>文件结果</h2></div>
+          <a class="button secondary" href="/report.csv">下载脱敏 CSV</a>
+        </div>
+        <div class="toolbar">
+          <label class="search-field"><span>搜索</span><input id="search-input" type="search" placeholder="文件名或原因" autocomplete="off"></label>
+          <label><span>状态</span><select id="status-filter"><option value="">全部状态</option><option>Candidate</option><option>Repaired</option><option>Healthy</option><option>Skipped</option><option>Uncertain</option><option>WaitingStable</option><option>Failed</option></select></label>
+          <p id="result-count" class="result-count">—</p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>文件</th><th>状态</th><th>原因</th><th>时间戳样本</th><th>检查时间</th></tr></thead>
+            <tbody id="files-body"><tr><td colspan="5" class="empty-cell">正在加载…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="lower-grid">
+        <article class="panel">
+          <div class="panel-heading"><div><p class="section-kicker">RECENT EVENTS</p><h2>最近事件</h2></div></div>
+          <ol id="history-list" class="history-list"><li class="empty-cell">暂无事件</li></ol>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><div><p class="section-kicker">RUNTIME</p><h2>运行配置</h2></div></div>
+          <dl class="config-list">
+            <div><dt>扫描间隔</dt><dd id="config-interval">—</dd></div>
+            <div><dt>最小文件年龄</dt><dd id="config-min-age">—</dd></div>
+            <div><dt>文件名过滤</dt><dd id="config-filter">—</dd></div>
+            <div><dt>路径显示</dt><dd id="config-paths">—</dd></div>
+          </dl>
+          <p class="security-note">界面只提供读取功能，不包含修改、删除或手动修复操作。</p>
+        </article>
+      </section>
+    </main>
+
+    <footer><span>自动刷新：10 秒</span><span id="last-updated">尚未更新</span></footer>
+  </div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

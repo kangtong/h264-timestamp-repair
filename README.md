@@ -14,6 +14,7 @@
 - 修复后检查轨道、视频属性、帧数、时间戳和多段解码结果。
 - 在媒体目录中暂存并校验 SHA-256，然后原子替换原文件；失败时自动回滚。
 - 使用 SQLite 增量缓存，未变化的文件不会重复分析。
+- 提供带身份验证的只读 Web 控制台，可查看扫描进度、结果统计、文件状态和最近事件。
 - 支持 `linux/amd64` 和 `linux/arm64`。
 
 ## 快速部署
@@ -21,7 +22,7 @@
 公开镜像：
 
 ```text
-kangtong1993/h264-timestamp-repair:1.0.0
+kangtong1993/h264-timestamp-repair:1.1.0
 ```
 
 复制示例配置：
@@ -63,12 +64,37 @@ docker compose -f docker-compose.hub.yml up -d --force-recreate
 
 任何支持 Docker Compose 的 Linux 服务器、家用服务器或 NAS 都可以采用相同方式部署。
 
+## Web 界面
+
+Compose 默认把只读 Web 界面发布到主机的 `8080` 端口：
+
+```text
+http://服务器IP:8080
+```
+
+默认用户名为 `admin`。如果 `.env` 中的 `WEB_PASSWORD` 留空，服务会在第一次启动时生成随机密码并写入：
+
+```text
+config/web-password.txt
+```
+
+也可以在启动前设置固定密码：
+
+```env
+WEB_USERNAME=admin
+WEB_PASSWORD=请填写强密码
+```
+
+Web 界面及其 JSON API 均使用 HTTP Basic Auth。界面只提供读取功能，不包含修改配置、删除文件或手动触发修复的操作。默认只显示文件名，API 和下载的 CSV 也不会包含完整媒体路径；如确有需要，可设置 `WEB_SHOW_FULL_PATHS=true`。
+
+端口默认监听所有主机网络接口，便于局域网访问。HTTP Basic Auth 本身不加密连接，因此不要把该端口直接暴露到互联网；也可以设置 `WEB_UI_BIND_ADDRESS=127.0.0.1`，再通过启用 HTTPS 的受保护反向代理访问。
+
 ## 配置项
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `MEDIA_HOST_PATH` | 无 | Docker 主机上的媒体目录绝对路径 |
-| `DOCKER_IMAGE` | `kangtong1993/h264-timestamp-repair:1.0.0` | 使用的容器镜像 |
+| `DOCKER_IMAGE` | `kangtong1993/h264-timestamp-repair:1.1.0` | 使用的容器镜像 |
 | `AUTO_REPAIR` | `false` | `false` 仅扫描，`true` 自动修复并覆盖原文件 |
 | `NAME_CONTAINS` | 空 | 可选文件名过滤；为空时扫描所有 MP4 |
 | `SCAN_INTERVAL_SECONDS` | `1800` | 两轮扫描之间的等待时间 |
@@ -78,6 +104,12 @@ docker compose -f docker-compose.hub.yml up -d --force-recreate
 | `MINIMUM_PACKETS` | `60` | 判定所需的最少可比较数据包数 |
 | `RETRY_FAILED_AFTER_SECONDS` | `86400` | 失败文件的重试间隔 |
 | `KEEP_TEMP_ON_FAILURE` | `false` | 失败时是否保留工作文件用于诊断 |
+| `WEB_UI_ENABLED` | `true` | 是否启用只读 Web 界面 |
+| `WEB_UI_BIND_ADDRESS` | `0.0.0.0` | Web 端口在 Docker 主机上的绑定地址 |
+| `WEB_UI_HOST_PORT` | `8080` | Docker 主机上的 Web 端口 |
+| `WEB_USERNAME` | `admin` | Web 登录用户名 |
+| `WEB_PASSWORD` | 空 | Web 密码；为空时自动生成并持久化 |
+| `WEB_SHOW_FULL_PATHS` | `false` | 是否在 Web/API/CSV 中显示完整媒体路径 |
 
 ## 判定逻辑
 
@@ -113,7 +145,7 @@ docker compose -f docker-compose.hub.yml up -d --force-recreate
 固定版本标签适合稳定部署：
 
 ```env
-DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:1.0.0
+DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:1.1.0
 ```
 
 拉取更新并重新创建服务：

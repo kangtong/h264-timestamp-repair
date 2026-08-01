@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from web_ui import WebService, start_web_server
+
 
 def env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -44,6 +46,12 @@ KEEP_TEMP_ON_FAILURE = env_bool("KEEP_TEMP_ON_FAILURE", False)
 FFMPEG = os.getenv("FFMPEG_BIN", "ffmpeg")
 FFPROBE = os.getenv("FFPROBE_BIN", "ffprobe")
 MP4BOX = os.getenv("MP4BOX_BIN", "MP4Box")
+WEB_UI_ENABLED = env_bool("WEB_UI_ENABLED", True)
+WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")
+WEB_UI_PORT = min(65535, max(1, int(os.getenv("WEB_UI_PORT", "8080"))))
+WEB_USERNAME = os.getenv("WEB_USERNAME", "admin").strip() or "admin"
+WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
+WEB_SHOW_FULL_PATHS = env_bool("WEB_SHOW_FULL_PATHS", False)
 
 STOP_REQUESTED = False
 CURRENT_CHILD: subprocess.Popen[str] | None = None
@@ -415,6 +423,8 @@ class State:
         self.path = path
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA busy_timeout=5000")
         self.db.execute(
             """
             CREATE TABLE IF NOT EXISTS files (
@@ -522,7 +532,13 @@ def should_use_cache(row: sqlite3.Row, stat: os.stat_result) -> bool:
     return False
 
 
-def write_heartbeat(cycle_started: float, files: int, complete: bool) -> None:
+def write_heartbeat(
+    cycle_started: float,
+    files: int,
+    complete: bool,
+    current_index: int = 0,
+    current_path: Path | None = None,
+) -> None:
     payload = {
         "pid": os.getpid(),
         "time": time.time(),
@@ -530,6 +546,8 @@ def write_heartbeat(cycle_started: float, files: int, complete: bool) -> None:
         "files_seen": files,
         "cycle_complete": complete,
         "auto_repair": AUTO_REPAIR,
+        "current_index": current_index,
+        "current_path": str(current_path) if current_path else "",
     }
     target = CONFIG_ROOT / "heartbeat.json"
     temporary = target.with_suffix(".tmp")
@@ -545,6 +563,7 @@ def scan_cycle(state: State) -> None:
     for index, path in enumerate(files, start=1):
         if STOP_REQUESTED:
             break
+        write_heartbeat(cycle_started, len(files), False, index, path)
         try:
             stat = path.stat()
             row = state.get(path)
@@ -595,9 +614,9 @@ def scan_cycle(state: State) -> None:
                 pass
         finally:
             state.export_csv(CONFIG_ROOT / "latest.csv")
-            write_heartbeat(cycle_started, len(files), False)
+            write_heartbeat(cycle_started, len(files), False, index, path)
     state.export_csv(CONFIG_ROOT / "latest.csv")
-    write_heartbeat(cycle_started, len(files), not STOP_REQUESTED)
+    write_heartbeat(cycle_started, len(files), not STOP_REQUESTED, len(files), None)
     LOG.info("Scan cycle complete")
 
 
@@ -646,6 +665,26 @@ def main() -> int:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     state = State(CONFIG_ROOT / "state.sqlite3")
+    web_service: WebService | None = None
+    if WEB_UI_ENABLED:
+        try:
+            web_service = start_web_server(
+                config_root=CONFIG_ROOT,
+                host=WEB_UI_HOST,
+                port=WEB_UI_PORT,
+                username=WEB_USERNAME,
+                password=WEB_PASSWORD,
+                show_full_paths=WEB_SHOW_FULL_PATHS,
+                settings={
+                    "auto_repair": AUTO_REPAIR,
+                    "scan_interval_seconds": SCAN_INTERVAL,
+                    "min_file_age_seconds": MIN_FILE_AGE,
+                    "name_filter_enabled": bool(NAME_CONTAINS),
+                    "show_full_paths": WEB_SHOW_FULL_PATHS,
+                },
+            )
+        except Exception:
+            LOG.exception("Web UI failed to start; repair service will continue without it")
     LOG.info(
         "Service started: media=%s name_contains=%r auto_repair=%s interval=%ss min_age=%ss",
         MEDIA_ROOT,
@@ -663,6 +702,8 @@ def main() -> int:
             while time.time() < deadline and not STOP_REQUESTED:
                 time.sleep(min(5, max(0, deadline - time.time())))
     finally:
+        if web_service:
+            web_service.stop()
         os.close(lock_descriptor)
     LOG.info("Service stopped")
     return 0
