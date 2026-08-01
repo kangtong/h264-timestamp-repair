@@ -1,0 +1,36 @@
+services:
+  h264-timestamp-repair:
+    image: ${DOCKER_IMAGE:-kangtong1993/h264-timestamp-repair:1.0.0}
+    pull_policy: always
+    container_name: h264-timestamp-repair
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      MEDIA_ROOT: /media
+      CONFIG_ROOT: /config
+      WORK_ROOT: /work
+      NAME_CONTAINS: "${NAME_CONTAINS:-}"
+      AUTO_REPAIR: ${AUTO_REPAIR:-false}
+      SCAN_INTERVAL_SECONDS: ${SCAN_INTERVAL_SECONDS:-1800}
+      MIN_FILE_AGE_SECONDS: ${MIN_FILE_AGE_SECONDS:-3600}
+      STABLE_SCANS: ${STABLE_SCANS:-1}
+      SAMPLE_SECONDS: ${SAMPLE_SECONDS:-8}
+      MINIMUM_PACKETS: ${MINIMUM_PACKETS:-60}
+      RETRY_FAILED_AFTER_SECONDS: ${RETRY_FAILED_AFTER_SECONDS:-86400}
+      KEEP_TEMP_ON_FAILURE: ${KEEP_TEMP_ON_FAILURE:-false}
+    volumes:
+      - ${MEDIA_HOST_PATH:?Set MEDIA_HOST_PATH in .env}:/media:rw
+      - ./config:/config:rw
+      - ./work:/work:rw
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15m
+    healthcheck:
+      test: ["CMD", "python3", "/app/repair_service.py", "--healthcheck"]
+      interval: 5m
+      timeout: 20s
+      retries: 3
+      start_period: 10m
