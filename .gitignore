@@ -1,0 +1,8 @@
+config/
+work/
+*.log
+*.pid
+*.zip
+__pycache__/
+*.pyc
+
