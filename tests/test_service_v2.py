@@ -138,6 +138,18 @@ class UtilityTests(unittest.TestCase):
         source = Path(service.__file__).read_text(encoding="utf-8")
         self.assertIn('[MP4BOX, "-tmp", str(job), "-add"', source)
 
+    def test_deterministic_repair_validation_uses_distinct_error(self) -> None:
+        original = service.Analysis(
+            "Candidate", "missing timestamps", {"streams": []},
+            {"codec_name": "h264"}, 60, 0,
+        )
+        fixed = service.Analysis(
+            "Candidate", "timestamps still missing", {"streams": []},
+            {"codec_name": "h264"}, 60, 0,
+        )
+        with self.assertRaises(service.RepairValidationError):
+            service.compare_streams(original, fixed)
+
 
 if __name__ == "__main__":
     unittest.main()

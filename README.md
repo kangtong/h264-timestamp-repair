@@ -25,7 +25,7 @@ curl -O https://raw.githubusercontent.com/kangtong/h264-timestamp-repair/main/do
 
 ```dotenv
 MEDIA_HOST_PATH=/srv/media
-DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:2.0.0
+DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:2.0.1
 TZ=Asia/Shanghai
 AUTO_REPAIR=false
 MIN_FILE_AGE_SECONDS=3600
@@ -50,7 +50,7 @@ Web 地址为 `http://NAS地址:8080/`。状态、文件列表和最近事件均
 | 变量 | 默认值 | 说明 |
 |---|---:|---|
 | `MEDIA_HOST_PATH` | 必填 | Docker 主机上的媒体目录 |
-| `DOCKER_IMAGE` | `kangtong1993/h264-timestamp-repair:2.0.0` | 容器镜像 |
+| `DOCKER_IMAGE` | `kangtong1993/h264-timestamp-repair:2.0.1` | 容器镜像 |
 | `TZ` | `Asia/Shanghai` | 容器本地时区 |
 | `NAME_CONTAINS` | 空 | 可选文件名过滤；空表示所有 MP4 |
 | `AUTO_REPAIR` | `false` | 是否自动修复确认候选 |
