@@ -54,7 +54,7 @@ def start_web_server(
     heartbeat_path = config_root / "heartbeat.json"
 
     class DashboardHandler(BaseHTTPRequestHandler):
-        server_version = "H264TimestampRepair/2.0"
+        server_version = "H264TimestampRepair/2.1"
 
         def log_message(self, format_text: str, *args: Any) -> None:
             LOG.debug("%s - %s", self.address_string(), format_text % args)

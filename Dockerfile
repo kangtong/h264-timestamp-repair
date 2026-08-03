@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 
-LABEL org.opencontainers.image.title="H.264 Timestamp Repair" \
-      org.opencontainers.image.description="Detect and repair missing H.264 composition timestamps in MP4 files without re-encoding video" \
+LABEL org.opencontainers.image.title="MP4 Playback Repair" \
+      org.opencontainers.image.description="Detect and losslessly repair MP4 timestamp and invalid chapter metadata problems" \
       org.opencontainers.image.source="https://github.com/kangtong/h264-timestamp-repair"
 
 ENV DEBIAN_FRONTEND=noninteractive \
