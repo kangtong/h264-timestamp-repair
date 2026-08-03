@@ -90,6 +90,10 @@ class Analysis:
     different: int = 0
 
 
+class RepairValidationError(RuntimeError):
+    """The rebuilt file is unsafe or ineffective, so retrying is not useful."""
+
+
 def request_stop(signum: int, _frame: Any) -> None:
     global STOP_REQUESTED
     STOP_REQUESTED = True
@@ -254,24 +258,24 @@ def assert_free_space(input_size: int) -> None:
 
 def compare_streams(original: Analysis, fixed: Analysis) -> None:
     if fixed.status != "Healthy" or fixed.different <= 0:
-        raise RuntimeError(f"Timestamp repair validation failed: {fixed.reason}")
+        raise RepairValidationError(f"Timestamp repair validation failed: {fixed.reason}")
     assert original.video is not None and fixed.video is not None
     for key in ("codec_name", "profile", "width", "height", "pix_fmt"):
         if str(original.video.get(key)) != str(fixed.video.get(key)):
-            raise RuntimeError(f"Video property changed unexpectedly: {key}")
+            raise RepairValidationError(f"Video property changed unexpectedly: {key}")
     before_frames = original.video.get("nb_frames")
     after_frames = fixed.video.get("nb_frames")
     if before_frames and after_frames and int(before_frames) != int(after_frames):
-        raise RuntimeError(f"Video frame count changed: {before_frames} -> {after_frames}")
+        raise RepairValidationError(f"Video frame count changed: {before_frames} -> {after_frames}")
 
     before_audio = [s for s in original.info.get("streams", []) if s.get("codec_type") == "audio"]
     after_audio = [s for s in fixed.info.get("streams", []) if s.get("codec_type") == "audio"]
     if len(before_audio) != len(after_audio):
-        raise RuntimeError("Audio stream count changed unexpectedly")
+        raise RepairValidationError("Audio stream count changed unexpectedly")
     for index, (before, after) in enumerate(zip(before_audio, after_audio)):
         for key in ("codec_name", "sample_rate", "channels"):
             if str(before.get(key)) != str(after.get(key)):
-                raise RuntimeError(f"Audio stream {index} property changed unexpectedly: {key}")
+                raise RepairValidationError(f"Audio stream {index} property changed unexpectedly: {key}")
 
 
 def validate_decode(repaired: Path, duration: float, job: Path) -> None:
@@ -337,7 +341,7 @@ def safe_replace(original: Path, repaired: Path, original_analysis: Analysis) ->
             installed = True
             final = analyze(original)
             if final.status != "Healthy" or final.different <= 0:
-                raise RuntimeError(f"Post-install timestamp validation failed: {final.reason}")
+                raise RepairValidationError(f"Post-install timestamp validation failed: {final.reason}")
         except Exception:
             if installed and original.exists():
                 original.unlink()
@@ -988,14 +992,28 @@ def process_pending(state: State, runtime: Runtime, row: sqlite3.Row) -> None:
         dropped_data = sum(1 for stream in result.info.get("streams", []) if stream.get("codec_type") == "data")
         final_hash = ""
         if result.status == "Candidate" and AUTO_REPAIR:
-            final_hash, dropped_data = repair_one(path, result)
-            stat = path.stat()
-            remember_internal_change(path, stat)
-            result = Analysis(
-                "Repaired",
-                "Composition timestamps rebuilt without video re-encoding; original replaced after validation",
-                result.info, result.video, result.comparable, result.different,
-            )
+            incompatible = compatibility_reason(result)
+            if incompatible:
+                result = Analysis(
+                    "Uncertain", incompatible, result.info, result.video,
+                    result.comparable, result.different,
+                )
+            else:
+                try:
+                    final_hash, dropped_data = repair_one(path, result)
+                except RepairValidationError as exc:
+                    result = Analysis(
+                        "Uncertain", compact_error(str(exc)), result.info, result.video,
+                        result.comparable, result.different,
+                    )
+                else:
+                    stat = path.stat()
+                    remember_internal_change(path, stat)
+                    result = Analysis(
+                        "Repaired",
+                        "Composition timestamps rebuilt without video re-encoding; original replaced after validation",
+                        result.info, result.video, result.comparable, result.different,
+                    )
         state.save(path, stat, result.status, result.reason, result.comparable, result.different, dropped_data, final_hash)
         state.record(path, result.status, result.reason)
         state.complete(path)
