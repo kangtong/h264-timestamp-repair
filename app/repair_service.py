@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from emby_refresh import EmbyItemNotReady, EmbyRefreshClient
 from web_ui import WebService, start_web_server
 
 try:
@@ -63,6 +64,11 @@ WEB_UI_ENABLED = env_bool("WEB_UI_ENABLED", True)
 WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")
 WEB_UI_PORT = min(65535, max(1, int(os.getenv("WEB_UI_PORT", "8080"))))
 WEB_SHOW_FULL_PATHS = env_bool("WEB_SHOW_FULL_PATHS", False)
+EMBY_REFRESH_RETRY_SECONDS = max(30, int(os.getenv("EMBY_REFRESH_RETRY_SECONDS", "60")))
+EMBY_REFRESH_MAX_RETRY_SECONDS = max(
+    EMBY_REFRESH_RETRY_SECONDS,
+    int(os.getenv("EMBY_REFRESH_MAX_RETRY_SECONDS", "21600")),
+)
 ANALYSIS_SIGNATURE = f"3:{SAMPLE_SECONDS}:{MINIMUM_PACKETS}:{int(REPAIR_EMPTY_FULL_CHAPTERS)}"
 LEGACY_ENV_NAMES = ("SCAN_INTERVAL_SECONDS", "STABLE_SCANS", "WEB_USERNAME", "WEB_PASSWORD")
 MAX_ERROR_LENGTH = 4096
@@ -554,12 +560,13 @@ class State:
     def remove(self, path: Path) -> None:
         value = str(path)
         self.db.execute("DELETE FROM pending WHERE path = ?", (value,))
+        self.db.execute("DELETE FROM media_refresh_queue WHERE path = ?", (value,))
         self.db.execute("DELETE FROM files WHERE path = ?", (value,))
         self.db.commit()
 
     def remove_tree(self, path: Path) -> None:
         prefix = str(path).rstrip("/\\") + os.sep
-        for table in ("pending", "files"):
+        for table in ("pending", "media_refresh_queue", "files"):
             self.db.execute(
                 f"DELETE FROM {table} WHERE substr(path,1,?)=?",
                 (len(prefix), prefix),
@@ -605,6 +612,45 @@ class State:
         value = self.db.execute("SELECT MIN(eligible_at) FROM pending").fetchone()[0]
         return float(value) if value is not None else None
 
+    def enqueue_media_refresh(self, path: Path, eligible_at: float | None = None) -> None:
+        now = time.time()
+        self.db.execute(
+            """
+            INSERT INTO media_refresh_queue(path,queued_at,eligible_at,attempts,last_error)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(path) DO UPDATE SET
+              queued_at=excluded.queued_at,eligible_at=MIN(media_refresh_queue.eligible_at,excluded.eligible_at),
+              last_error=''
+            """,
+            (str(path), now, now if eligible_at is None else eligible_at, 0, ""),
+        )
+        self.db.commit()
+        WAKE_EVENT.set()
+
+    def due_media_refresh(self, limit: int = 10) -> list[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT * FROM media_refresh_queue WHERE eligible_at <= ? ORDER BY eligible_at,path LIMIT ?",
+            (time.time(), limit),
+        ).fetchall()
+
+    def defer_media_refresh(self, path: Path, eligible_at: float, error: str) -> None:
+        self.db.execute(
+            "UPDATE media_refresh_queue SET eligible_at=?,attempts=attempts+1,last_error=? WHERE path=?",
+            (eligible_at, compact_error(error), str(path)),
+        )
+        self.db.commit()
+
+    def complete_media_refresh(self, path: Path) -> None:
+        self.db.execute("DELETE FROM media_refresh_queue WHERE path=?", (str(path),))
+        self.db.commit()
+
+    def media_refresh_pending_count(self) -> int:
+        return int(self.db.execute("SELECT COUNT(*) FROM media_refresh_queue").fetchone()[0])
+
+    def next_media_refresh_due(self) -> float | None:
+        value = self.db.execute("SELECT MIN(eligible_at) FROM media_refresh_queue").fetchone()[0]
+        return float(value) if value is not None else None
+
     def record(self, path: Path, status: str, reason: str) -> None:
         self.db.execute(
             "INSERT INTO events(event_time,path,status,reason) VALUES(?,?,?,?)",
@@ -645,6 +691,11 @@ class State:
             self.remove(source)
             return False
         self.db.execute("DELETE FROM pending WHERE path IN (?,?)", (str(source), str(destination)))
+        self.db.execute("DELETE FROM media_refresh_queue WHERE path=?", (str(destination),))
+        self.db.execute(
+            "UPDATE media_refresh_queue SET path=? WHERE path=?",
+            (str(destination), str(source)),
+        )
         self.db.execute("DELETE FROM files WHERE path=?", (str(destination),))
         self.db.execute(
             "UPDATE files SET path=?,ctime_ns=? WHERE path=?",
@@ -684,6 +735,14 @@ def create_schema(connection: sqlite3.Connection) -> None:
           attempts INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_pending_due ON pending(eligible_at);
+        CREATE TABLE IF NOT EXISTS media_refresh_queue (
+          path TEXT PRIMARY KEY,
+          queued_at REAL NOT NULL,
+          eligible_at REAL NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_media_refresh_due ON media_refresh_queue(eligible_at);
         CREATE TABLE IF NOT EXISTS events (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           event_time REAL NOT NULL,
@@ -893,6 +952,8 @@ class Runtime:
         self.next_reconcile = 0.0
         self.processed_session = 0
         self.pending_count = 0
+        self.media_refresh_pending_count = 0
+        self.media_refresh_enabled = False
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -902,6 +963,8 @@ class Runtime:
                 "current_path": self.current_path, "current_action": self.current_action,
                 "last_reconcile": self.last_reconcile, "next_reconcile": self.next_reconcile,
                 "processed_session": self.processed_session, "pending_count": self.pending_count,
+                "media_refresh_pending_count": self.media_refresh_pending_count,
+                "media_refresh_enabled": self.media_refresh_enabled,
             }
 
 
@@ -1011,7 +1074,13 @@ def drain_events(state: State, events: queue.Queue[WatchEvent]) -> None:
             state.enqueue(event.source, event.kind, time.time() + FILE_SETTLE_SECONDS, True)
 
 
-def process_pending(state: State, runtime: Runtime, row: sqlite3.Row) -> None:
+def process_pending(
+    state: State,
+    runtime: Runtime,
+    row: sqlite3.Row,
+    *,
+    media_refresh_enabled: bool = False,
+) -> None:
     path = Path(str(row["path"]))
     with runtime.lock:
         runtime.current_action = "process"
@@ -1067,6 +1136,9 @@ def process_pending(state: State, runtime: Runtime, row: sqlite3.Row) -> None:
                     )
         state.save(path, stat, result.status, result.reason, result.comparable, result.different, dropped_data, final_hash)
         state.record(path, result.status, result.reason)
+        if result.status == "Repaired" and media_refresh_enabled:
+            state.enqueue_media_refresh(path)
+            state.record(path, "MediaRefreshQueued", "Media-library refresh queued after repair")
         state.complete(path)
         with runtime.lock:
             runtime.processed_session += 1
@@ -1084,6 +1156,45 @@ def process_pending(state: State, runtime: Runtime, row: sqlite3.Row) -> None:
             runtime.current_path = ""
             runtime.current_action = "idle"
             runtime.pending_count = state.pending_count()
+            runtime.media_refresh_pending_count = state.media_refresh_pending_count()
+
+
+def media_refresh_retry_delay(attempts: int) -> int:
+    return min(EMBY_REFRESH_MAX_RETRY_SECONDS, EMBY_REFRESH_RETRY_SECONDS * (2 ** min(attempts, 10)))
+
+
+def process_media_refresh(
+    state: State,
+    runtime: Runtime,
+    client: EmbyRefreshClient,
+    row: sqlite3.Row,
+) -> None:
+    path = Path(str(row["path"]))
+    with runtime.lock:
+        runtime.current_action = "media-refresh"
+        runtime.current_path = str(path)
+    try:
+        client.refresh(path)
+    except Exception as exc:
+        reason = compact_error(str(exc))
+        attempts = int(row["attempts"])
+        delay = media_refresh_retry_delay(attempts)
+        state.defer_media_refresh(path, time.time() + delay, reason)
+        status = "MediaRefreshWaiting" if isinstance(exc, EmbyItemNotReady) else "MediaRefreshDeferred"
+        state.record(path, status, f"{reason}; retry in {delay} seconds")
+        if isinstance(exc, EmbyItemNotReady):
+            LOG.info("Media-library item is not ready; refresh deferred for %s seconds: %s", delay, path)
+        else:
+            LOG.warning("Media-library refresh failed; retrying in %s seconds: %s", delay, reason)
+    else:
+        state.complete_media_refresh(path)
+        state.record(path, "MediaRefreshed", "Full media-library refresh requested after repair")
+        LOG.info("Media-library refresh requested after repair: %s", path)
+    finally:
+        with runtime.lock:
+            runtime.current_path = ""
+            runtime.current_action = "idle"
+            runtime.media_refresh_pending_count = state.media_refresh_pending_count()
 
 
 def healthcheck() -> int:
@@ -1138,6 +1249,9 @@ def main() -> int:
     signal.signal(signal.SIGINT, request_stop)
     state = State(CONFIG_ROOT / "state.sqlite3")
     runtime = Runtime()
+    media_refresh_client = EmbyRefreshClient.from_environment(MEDIA_ROOT)
+    runtime.media_refresh_enabled = media_refresh_client is not None
+    runtime.media_refresh_pending_count = state.media_refresh_pending_count()
     runtime.last_reconcile = float(state.meta_get("last_reconcile", "0") or 0)
     runtime.next_reconcile = next_reconcile_time()
     events: queue.Queue[WatchEvent] = queue.Queue()
@@ -1165,6 +1279,7 @@ def main() -> int:
                 settings={
                     "auto_repair": AUTO_REPAIR,
                     "repair_empty_full_chapters": REPAIR_EMPTY_FULL_CHAPTERS,
+                    "media_refresh_enabled": media_refresh_client is not None,
                     "file_settle_seconds": FILE_SETTLE_SECONDS,
                     "min_file_age_seconds": MIN_FILE_AGE,
                     "reconcile_local_time": RECONCILE_LOCAL_TIME,
@@ -1176,8 +1291,9 @@ def main() -> int:
             LOG.exception("Web UI failed to start; repair service will continue without it")
 
     LOG.info(
-        "Service 2.1 started: media=%s auto_repair=%s empty_full_chapters=%s reconcile=%s",
-        MEDIA_ROOT, AUTO_REPAIR, REPAIR_EMPTY_FULL_CHAPTERS, RECONCILE_LOCAL_TIME,
+        "Service 2.2 started: media=%s auto_repair=%s empty_full_chapters=%s media_refresh=%s reconcile=%s",
+        MEDIA_ROOT, AUTO_REPAIR, REPAIR_EMPTY_FULL_CHAPTERS,
+        media_refresh_client is not None, RECONCILE_LOCAL_TIME,
     )
     try:
         reconcile(state, runtime)
@@ -1185,13 +1301,25 @@ def main() -> int:
             drain_events(state, events)
             if time.time() >= runtime.next_reconcile:
                 reconcile(state, runtime)
+            refresh_due = state.due_media_refresh(100 if args.once else 1) if media_refresh_client else []
+            if refresh_due:
+                for refresh_row in refresh_due:
+                    process_media_refresh(state, runtime, media_refresh_client, refresh_row)
+                if not args.once:
+                    continue
             due = state.due(1 if not args.once else 100)
             if due:
                 for pending in due:
                     if STOP_REQUESTED:
                         break
-                    process_pending(state, runtime, pending)
+                    process_pending(
+                        state, runtime, pending,
+                        media_refresh_enabled=media_refresh_client is not None,
+                    )
                 if args.once:
+                    if media_refresh_client:
+                        for refresh_row in state.due_media_refresh(100):
+                            process_media_refresh(state, runtime, media_refresh_client, refresh_row)
                     break
                 continue
             if args.once:
@@ -1199,7 +1327,13 @@ def main() -> int:
             with runtime.lock:
                 runtime.pending_count = state.pending_count()
             next_due = state.next_due()
-            deadline = min(runtime.next_reconcile, next_due if next_due is not None else runtime.next_reconcile)
+            refresh_next_due = state.next_media_refresh_due() if media_refresh_client else None
+            deadlines = [runtime.next_reconcile]
+            if next_due is not None:
+                deadlines.append(next_due)
+            if refresh_next_due is not None:
+                deadlines.append(refresh_next_due)
+            deadline = min(deadlines)
             WAKE_EVENT.wait(max(0.1, min(60.0, deadline - time.time())))
             WAKE_EVENT.clear()
     finally:

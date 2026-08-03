@@ -54,9 +54,13 @@ function renderStatus(data) {
 
   const heartbeat = data.heartbeat || {};
   const pending = Number(heartbeat.pending_count ?? summary.pending ?? 0);
+  const refreshPending = Number(heartbeat.media_refresh_pending_count ?? summary.media_refresh_pending ?? 0);
   const active = Boolean(heartbeat.current_path);
-  $("progress-bar").style.width = active ? "45%" : (pending ? "15%" : "100%");
-  $("progress-text").textContent = pending ? `${pending} 个文件` : "队列为空";
+  $("progress-bar").style.width = active ? "45%" : ((pending || refreshPending) ? "15%" : "100%");
+  const queueParts = [];
+  if (pending) queueParts.push(`${pending} 个文件`);
+  if (refreshPending) queueParts.push(`${refreshPending} 个媒体库刷新`);
+  $("progress-text").textContent = queueParts.length ? queueParts.join("；") : "队列为空";
   $("current-file").textContent = heartbeat.current_path || (heartbeat.current_action === "reconcile" ? "正在校准元数据" : "—");
   $("heartbeat-age").textContent = formatAge(data.heartbeat_age_seconds);
 
@@ -79,6 +83,7 @@ function renderStatus(data) {
   $("config-reconcile").textContent = `每天 ${config.reconcile_local_time || "04:00"}`;
   $("config-settle").textContent = formatSeconds(config.file_settle_seconds);
   $("config-min-age").textContent = formatSeconds(config.min_file_age_seconds);
+  $("config-media-refresh").textContent = config.media_refresh_enabled ? "已启用（失败自动重试）" : "未配置";
   $("config-filter").textContent = config.name_filter_enabled ? "已启用" : "未启用（全部 MP4）";
   $("config-paths").textContent = config.show_full_paths ? "完整路径" : "仅文件名（脱敏）";
 }

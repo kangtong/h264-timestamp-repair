@@ -1,6 +1,6 @@
 services:
   h264-timestamp-repair:
-    image: ${DOCKER_IMAGE:-kangtong1993/h264-timestamp-repair:2.1.0}
+    image: ${DOCKER_IMAGE:-kangtong1993/h264-timestamp-repair:2.2.0}
     pull_policy: always
     container_name: h264-timestamp-repair
     restart: unless-stopped
@@ -12,6 +12,12 @@ services:
       NAME_CONTAINS: "${NAME_CONTAINS:-}"
       AUTO_REPAIR: ${AUTO_REPAIR:-false}
       REPAIR_EMPTY_FULL_CHAPTERS: ${REPAIR_EMPTY_FULL_CHAPTERS:-true}
+      EMBY_URL: "${EMBY_URL:-}"
+      EMBY_MEDIA_ROOT: "${EMBY_MEDIA_ROOT:-}"
+      EMBY_API_KEY: "${EMBY_API_KEY:-}"
+      EMBY_API_KEY_FILE: "${EMBY_API_KEY_FILE:-}"
+      EMBY_REFRESH_RETRY_SECONDS: ${EMBY_REFRESH_RETRY_SECONDS:-60}
+      EMBY_REFRESH_MAX_RETRY_SECONDS: ${EMBY_REFRESH_MAX_RETRY_SECONDS:-21600}
       MIN_FILE_AGE_SECONDS: ${MIN_FILE_AGE_SECONDS:-3600}
       FILE_SETTLE_SECONDS: ${FILE_SETTLE_SECONDS:-60}
       RECONCILE_LOCAL_TIME: "${RECONCILE_LOCAL_TIME:-04:00}"

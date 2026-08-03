@@ -54,7 +54,7 @@ def start_web_server(
     heartbeat_path = config_root / "heartbeat.json"
 
     class DashboardHandler(BaseHTTPRequestHandler):
-        server_version = "H264TimestampRepair/2.1"
+        server_version = "H264TimestampRepair/2.2"
 
         def log_message(self, format_text: str, *args: Any) -> None:
             LOG.debug("%s - %s", self.address_string(), format_text % args)
@@ -117,6 +117,9 @@ def start_web_server(
                 result = {str(row["status"]): int(row["count"]) for row in rows}
                 result["total"] = sum(result.values())
                 result["pending"] = int(connection.execute("SELECT COUNT(*) FROM pending").fetchone()[0])
+                result["media_refresh_pending"] = int(
+                    connection.execute("SELECT COUNT(*) FROM media_refresh_queue").fetchone()[0]
+                )
                 return result
             finally:
                 connection.close()

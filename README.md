@@ -2,7 +2,7 @@
 
 一个面向 Docker/Linux/NAS 的通用服务，用于检测 MP4 中缺失的 H.264 合成时间戳和无意义的整片空章节，并在严格验证后进行无损封装修复。视频和音频不会重新编码。
 
-## 2.1 的工作方式
+## 2.2 的工作方式
 
 - 使用 Linux 文件事件监听新增、写入、移动、重命名和删除，不再按固定间隔反复遍历整个媒体库。
 - 变化路径进入 SQLite 持久队列；最后一次变化静默 60 秒并满足最小文件年龄后处理。
@@ -12,6 +12,8 @@
 - Web 界面匿名且只读；默认隐藏完整媒体路径，不提供删除、配置修改或手动修复功能。
 - 时间戳异常和章节异常分别判定；两者同时存在时合并为一次修复，避免重复读写大文件。
 - 仅当文件恰好只有一个无标题章节、从 0 秒开始且结束时间等于片长时，才会自动移除该章节。
+- 可选的 Emby 后处理模块会在修复后按完整路径精确匹配条目，请求重新读取媒体信息和替换章节缩略图。
+- 条目尚未入库或服务器暂时不可用时，通知保存在 SQLite 独立队列中并自动退避重试，不影响文件修复状态。
 
 > Web 端口没有登录验证。请只在可信局域网中开放，绝对不要直接暴露到互联网。
 
@@ -27,7 +29,7 @@ curl -O https://raw.githubusercontent.com/kangtong/h264-timestamp-repair/main/do
 
 ```dotenv
 MEDIA_HOST_PATH=/srv/media
-DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:2.1.0
+DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:2.2.0
 TZ=Asia/Shanghai
 AUTO_REPAIR=false
 REPAIR_EMPTY_FULL_CHAPTERS=true
@@ -36,6 +38,18 @@ FILE_SETTLE_SECONDS=60
 RECONCILE_LOCAL_TIME=04:00
 WEB_UI_HOST_PORT=8080
 ```
+
+可选的 Emby 自动刷新示例。API 密钥建议保存为 `config/emby-api-key`，权限设为仅管理员可读；不要提交到 Git：
+
+```dotenv
+EMBY_URL=http://media-server:8096/emby
+EMBY_MEDIA_ROOT=/path-seen-by-emby
+EMBY_API_KEY_FILE=/config/emby-api-key
+EMBY_REFRESH_RETRY_SECONDS=60
+EMBY_REFRESH_MAX_RETRY_SECONDS=21600
+```
+
+`MEDIA_ROOT` 是本容器看到的路径，`EMBY_MEDIA_ROOT` 是 Emby 看到的同一目录。两边的相对路径必须一致；程序只在完整路径唯一匹配时发送刷新请求。
 
 先以只扫描模式启动：
 
@@ -53,7 +67,7 @@ Web 地址为 `http://NAS地址:8080/`。状态、文件列表和最近事件均
 | 变量 | 默认值 | 说明 |
 |---|---:|---|
 | `MEDIA_HOST_PATH` | 必填 | Docker 主机上的媒体目录 |
-| `DOCKER_IMAGE` | `kangtong1993/h264-timestamp-repair:2.1.0` | 容器镜像 |
+| `DOCKER_IMAGE` | `kangtong1993/h264-timestamp-repair:2.2.0` | 容器镜像 |
 | `TZ` | `Asia/Shanghai` | 容器本地时区 |
 | `NAME_CONTAINS` | 空 | 可选文件名过滤；空表示所有 MP4 |
 | `AUTO_REPAIR` | `false` | 是否自动修复确认候选 |
@@ -66,6 +80,12 @@ Web 地址为 `http://NAS地址:8080/`。状态、文件列表和最近事件均
 | `RETRY_FAILED_AFTER_SECONDS` | `86400` | 失败后的重试间隔 |
 | `EVENT_HISTORY_LIMIT` | `5000` | SQLite 最近事件保留条数 |
 | `KEEP_TEMP_ON_FAILURE` | `false` | 是否在 `/work` 保留失败现场 |
+| `EMBY_URL` | 空 | Emby API 基础地址；为空时不启用集成 |
+| `EMBY_MEDIA_ROOT` | 空 | Emby 中与 `MEDIA_ROOT` 对应的媒体根路径 |
+| `EMBY_API_KEY_FILE` | 空 | 推荐：容器内 API 密钥文件路径 |
+| `EMBY_API_KEY` | 空 | 备选：直接传入 API 密钥；不建议用于长期部署 |
+| `EMBY_REFRESH_RETRY_SECONDS` | `60` | 首次媒体库刷新重试间隔 |
+| `EMBY_REFRESH_MAX_RETRY_SECONDS` | `21600` | 媒体库刷新最大重试间隔 |
 | `WEB_UI_ENABLED` | `true` | 是否启用匿名只读 Web 界面 |
 | `WEB_UI_BIND_ADDRESS` | `0.0.0.0` | Docker 主机端口绑定地址 |
 | `WEB_UI_HOST_PORT` | `8080` | Docker 主机 Web 端口 |
@@ -77,7 +97,10 @@ Web 地址为 `http://NAS地址:8080/`。状态、文件列表和最近事件均
 
 从 2.0 升级到 2.1 后，分析规则版本会变化，因此现有 MP4 会进行一次必要的重新分析，以发现以前未检测的章节问题。此后未变化文件仍会直接命中 SQLite 缓存，每日校准不会反复运行 FFprobe。
 
+从 2.1 升级到 2.2 不改变媒体分析签名，因此不会再次触发全库重新分析；尚未完成的扫描队列会原样继续。
+
 - `config/state.sqlite3`：文件身份、分析结果、待处理队列和最近事件。
+- `media_refresh_queue`：位于同一 SQLite 数据库中的媒体服务器通知队列，成功请求刷新后自动删除。
 - `config/heartbeat.json`：健康检查与当前任务状态。
 - `work/job-*`：修复过程中的临时文件；成功后自动清理。
 
@@ -90,6 +113,7 @@ Web 地址为 `http://NAS地址:8080/`。状态、文件列表和最近事件均
 - 原文件在完整修复、属性比较、抽样解码、哈希和安装后验证全部成功前不会被替换。
 - 文件系统监听不可用时服务进入降级状态，但仍由每日元数据校准发现变化。
 - 硬链接和无法可靠识别的移动不会跨路径共享修复结果，优先保证安全。
+- Emby 集成不会替换全部元数据或全部图片；刷新失败不会把已经验证成功的媒体修复标记为失败。
 
 ## 架构
 
