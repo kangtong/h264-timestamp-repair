@@ -127,6 +127,19 @@ class RefreshQueueTests(unittest.TestCase):
         event = self.state.db.execute("SELECT status FROM events ORDER BY id DESC LIMIT 1").fetchone()
         self.assertEqual("MediaRefreshWaiting", event["status"])
 
+    def test_chapter_repair_backfill_runs_once(self) -> None:
+        media = self.root / "already-repaired.mp4"
+        media.write_bytes(b"media")
+        self.state.save(
+            media, media.stat(), "Repaired",
+            "invalid full-duration chapter removed; streams copied without re-encoding",
+        )
+        self.assertEqual(1, self.state.backfill_chapter_media_refreshes())
+        self.assertEqual(1, self.state.media_refresh_pending_count())
+        self.state.complete_media_refresh(media)
+        self.assertEqual(0, self.state.backfill_chapter_media_refreshes())
+        self.assertEqual(0, self.state.media_refresh_pending_count())
+
     def test_successful_media_repair_queues_library_refresh(self) -> None:
         media = self.root / "video.mp4"
         media.write_bytes(b"media")

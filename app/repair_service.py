@@ -651,6 +651,30 @@ class State:
         value = self.db.execute("SELECT MIN(eligible_at) FROM media_refresh_queue").fetchone()[0]
         return float(value) if value is not None else None
 
+    def backfill_chapter_media_refreshes(self) -> int:
+        marker = "media_refresh_chapter_backfill_v1"
+        if self.meta_get(marker) == "complete":
+            return 0
+        now = time.time()
+        self.db.execute(
+            """
+            INSERT OR IGNORE INTO media_refresh_queue(path,queued_at,eligible_at,attempts,last_error)
+            SELECT path,?,?,0,'' FROM files
+            WHERE status='Repaired' AND reason LIKE '%invalid full-duration chapter removed%'
+            """,
+            (now, now),
+        )
+        added = int(self.db.execute("SELECT changes()").fetchone()[0])
+        self.db.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (marker, "complete"),
+        )
+        self.db.commit()
+        if added:
+            WAKE_EVENT.set()
+        return added
+
     def record(self, path: Path, status: str, reason: str) -> None:
         self.db.execute(
             "INSERT INTO events(event_time,path,status,reason) VALUES(?,?,?,?)",
@@ -1251,6 +1275,10 @@ def main() -> int:
     runtime = Runtime()
     media_refresh_client = EmbyRefreshClient.from_environment(MEDIA_ROOT)
     runtime.media_refresh_enabled = media_refresh_client is not None
+    if media_refresh_client is not None:
+        backfilled = state.backfill_chapter_media_refreshes()
+        if backfilled:
+            LOG.info("Queued %d earlier chapter repairs for one-time media-library refresh", backfilled)
     runtime.media_refresh_pending_count = state.media_refresh_pending_count()
     runtime.last_reconcile = float(state.meta_get("last_reconcile", "0") or 0)
     runtime.next_reconcile = next_reconcile_time()
