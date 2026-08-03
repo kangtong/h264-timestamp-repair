@@ -29,7 +29,7 @@ curl -O https://raw.githubusercontent.com/kangtong/h264-timestamp-repair/main/do
 
 ```dotenv
 MEDIA_HOST_PATH=/srv/media
-DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:2.2.0
+DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:2.2.1
 TZ=Asia/Shanghai
 AUTO_REPAIR=false
 REPAIR_EMPTY_FULL_CHAPTERS=true
@@ -67,7 +67,7 @@ Web 地址为 `http://NAS地址:8080/`。状态、文件列表和最近事件均
 | 变量 | 默认值 | 说明 |
 |---|---:|---|
 | `MEDIA_HOST_PATH` | 必填 | Docker 主机上的媒体目录 |
-| `DOCKER_IMAGE` | `kangtong1993/h264-timestamp-repair:2.2.0` | 容器镜像 |
+| `DOCKER_IMAGE` | `kangtong1993/h264-timestamp-repair:2.2.1` | 容器镜像 |
 | `TZ` | `Asia/Shanghai` | 容器本地时区 |
 | `NAME_CONTAINS` | 空 | 可选文件名过滤；空表示所有 MP4 |
 | `AUTO_REPAIR` | `false` | 是否自动修复确认候选 |
@@ -98,6 +98,8 @@ Web 地址为 `http://NAS地址:8080/`。状态、文件列表和最近事件均
 从 2.0 升级到 2.1 后，分析规则版本会变化，因此现有 MP4 会进行一次必要的重新分析，以发现以前未检测的章节问题。此后未变化文件仍会直接命中 SQLite 缓存，每日校准不会反复运行 FFprobe。
 
 从 2.1 升级到 2.2 不改变媒体分析签名，因此不会再次触发全库重新分析；尚未完成的扫描队列会原样继续。
+
+2.2.1 会在首次启用集成时，把升级前已经完成的异常章节修复一次性补入媒体刷新队列，并记录迁移标记防止以后重启时重复通知。
 
 - `config/state.sqlite3`：文件身份、分析结果、待处理队列和最近事件。
 - `media_refresh_queue`：位于同一 SQLite 数据库中的媒体服务器通知队列，成功请求刷新后自动删除。
