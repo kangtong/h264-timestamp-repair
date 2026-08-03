@@ -6,10 +6,18 @@ on:
       version:
         description: Image version, for example 1.0.0
         required: true
-        default: 1.1.0
+        default: 2.0.0
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
   publish:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
