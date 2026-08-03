@@ -47,6 +47,7 @@ CONFIG_ROOT = Path(os.getenv("CONFIG_ROOT", "/config"))
 WORK_ROOT = Path(os.getenv("WORK_ROOT", "/work"))
 NAME_CONTAINS = os.getenv("NAME_CONTAINS", "")
 AUTO_REPAIR = env_bool("AUTO_REPAIR", False)
+REPAIR_EMPTY_FULL_CHAPTERS = env_bool("REPAIR_EMPTY_FULL_CHAPTERS", True)
 MIN_FILE_AGE = max(0, int(os.getenv("MIN_FILE_AGE_SECONDS", "3600")))
 FILE_SETTLE_SECONDS = max(1, int(os.getenv("FILE_SETTLE_SECONDS", "60")))
 RECONCILE_LOCAL_TIME = os.getenv("RECONCILE_LOCAL_TIME", "04:00").strip()
@@ -62,7 +63,7 @@ WEB_UI_ENABLED = env_bool("WEB_UI_ENABLED", True)
 WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")
 WEB_UI_PORT = min(65535, max(1, int(os.getenv("WEB_UI_PORT", "8080"))))
 WEB_SHOW_FULL_PATHS = env_bool("WEB_SHOW_FULL_PATHS", False)
-ANALYSIS_SIGNATURE = f"2:{SAMPLE_SECONDS}:{MINIMUM_PACKETS}"
+ANALYSIS_SIGNATURE = f"3:{SAMPLE_SECONDS}:{MINIMUM_PACKETS}:{int(REPAIR_EMPTY_FULL_CHAPTERS)}"
 LEGACY_ENV_NAMES = ("SCAN_INTERVAL_SECONDS", "STABLE_SCANS", "WEB_USERNAME", "WEB_PASSWORD")
 MAX_ERROR_LENGTH = 4096
 
@@ -88,6 +89,8 @@ class Analysis:
     video: dict[str, Any] | None
     comparable: int = 0
     different: int = 0
+    timestamp_issue: bool = False
+    chapter_issue: bool = False
 
 
 class RepairValidationError(RuntimeError):
@@ -131,7 +134,10 @@ def run_logged(args: list[str], log_base: Path, label: str) -> None:
 def media_info(path: Path) -> dict[str, Any]:
     return json.loads(
         run_capture(
-            [FFPROBE, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+            [
+                FFPROBE, "-v", "error", "-show_streams", "-show_chapters",
+                "-show_format", "-of", "json", str(path),
+            ],
             "ffprobe stream inspection",
         )
     )
@@ -154,6 +160,26 @@ def fraction(value: Any) -> float:
         return float(numerator) / float(denominator)
     except (ValueError, ZeroDivisionError):
         return 0.0
+
+
+def has_empty_full_duration_chapter(info: dict[str, Any]) -> bool:
+    """Return true only for one untitled chapter that spans the complete file."""
+    if not REPAIR_EMPTY_FULL_CHAPTERS:
+        return False
+    chapters = info.get("chapters") or []
+    if len(chapters) != 1:
+        return False
+    try:
+        duration = float(info.get("format", {}).get("duration", 0.0) or 0.0)
+        start = float(chapters[0].get("start_time", 0.0) or 0.0)
+        end = float(chapters[0].get("end_time", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if duration <= 0:
+        return False
+    title = str((chapters[0].get("tags") or {}).get("title", "")).strip()
+    tolerance = max(0.1, duration * 0.00001)
+    return not title and abs(start) <= 0.05 and abs(end - duration) <= tolerance
 
 
 def timestamp_sample(path: Path, duration: float) -> tuple[int, int]:
@@ -197,26 +223,37 @@ def timestamp_sample(path: Path, duration: float) -> tuple[int, int]:
 def analyze(path: Path) -> Analysis:
     info = media_info(path)
     videos = primary_videos(info)
+    chapter_issue = has_empty_full_duration_chapter(info)
     if not videos:
         return Analysis("Skipped", "No primary video stream", info, None)
     video = videos[0]
+    comparable = different = 0
+    timestamp_issue = False
+    timestamp_reason = ""
+    if video.get("codec_name") == "h264" and int(video.get("has_b_frames", 0) or 0) > 0:
+        duration = float(info.get("format", {}).get("duration", 0.0) or 0.0)
+        comparable, different = timestamp_sample(path, duration)
+        if comparable < MINIMUM_PACKETS:
+            timestamp_reason = "Too few comparable packet timestamps"
+        elif different == 0:
+            timestamp_issue = True
+
+    problems = []
+    if timestamp_issue:
+        problems.append("H.264 B-frame composition timestamps are missing")
+    if chapter_issue:
+        problems.append("A single untitled chapter spans the full file")
+    if problems:
+        return Analysis(
+            "Candidate", "; ".join(problems), info, video, comparable, different,
+            timestamp_issue, chapter_issue,
+        )
+    if timestamp_reason:
+        return Analysis("Uncertain", timestamp_reason, info, video, comparable, different)
     if video.get("codec_name") != "h264":
-        return Analysis("Skipped", "Primary video is not H.264", info, video)
+        return Analysis("Skipped", "Primary video is not H.264 and no chapter issue was found", info, video)
     if int(video.get("has_b_frames", 0) or 0) <= 0:
         return Analysis("Healthy", "H.264 stream does not declare B-frames", info, video)
-    duration = float(info.get("format", {}).get("duration", 0.0) or 0.0)
-    comparable, different = timestamp_sample(path, duration)
-    if comparable < MINIMUM_PACKETS:
-        return Analysis("Uncertain", "Too few comparable packet timestamps", info, video, comparable, different)
-    if different == 0:
-        return Analysis(
-            "Candidate",
-            "B-frames present but all sampled packets have PTS equal to DTS",
-            info,
-            video,
-            comparable,
-            different,
-        )
     return Analysis("Healthy", "Composition timestamps are present", info, video, comparable, different)
 
 
@@ -224,10 +261,11 @@ def compatibility_reason(analysis: Analysis) -> str:
     videos = primary_videos(analysis.info)
     if len(videos) != 1:
         return "Exactly one primary video stream is required"
-    avg = fraction(analysis.video.get("avg_frame_rate") if analysis.video else None)
-    nominal = fraction(analysis.video.get("r_frame_rate") if analysis.video else None)
-    if avg <= 0 or nominal <= 0 or abs(avg - nominal) > max(0.001, nominal * 0.005):
-        return "Variable or ambiguous frame rate is not repaired automatically"
+    if analysis.timestamp_issue:
+        avg = fraction(analysis.video.get("avg_frame_rate") if analysis.video else None)
+        nominal = fraction(analysis.video.get("r_frame_rate") if analysis.video else None)
+        if avg <= 0 or nominal <= 0 or abs(avg - nominal) > max(0.001, nominal * 0.005):
+            return "Variable or ambiguous frame rate is not repaired automatically"
     bad_subtitles = [
         stream
         for stream in analysis.info.get("streams", [])
@@ -257,8 +295,10 @@ def assert_free_space(input_size: int) -> None:
 
 
 def compare_streams(original: Analysis, fixed: Analysis) -> None:
-    if fixed.status != "Healthy" or fixed.different <= 0:
+    if original.timestamp_issue and (fixed.timestamp_issue or fixed.different <= 0):
         raise RepairValidationError(f"Timestamp repair validation failed: {fixed.reason}")
+    if original.chapter_issue and has_empty_full_duration_chapter(fixed.info):
+        raise RepairValidationError("Invalid full-duration chapter remains after repair")
     assert original.video is not None and fixed.video is not None
     for key in ("codec_name", "profile", "width", "height", "pix_fmt"):
         if str(original.video.get(key)) != str(fixed.video.get(key)):
@@ -276,6 +316,22 @@ def compare_streams(original: Analysis, fixed: Analysis) -> None:
         for key in ("codec_name", "sample_rate", "channels"):
             if str(before.get(key)) != str(after.get(key)):
                 raise RepairValidationError(f"Audio stream {index} property changed unexpectedly: {key}")
+
+    before_subtitles = [s for s in original.info.get("streams", []) if s.get("codec_type") == "subtitle"]
+    after_subtitles = [s for s in fixed.info.get("streams", []) if s.get("codec_type") == "subtitle"]
+    if len(before_subtitles) != len(after_subtitles):
+        raise RepairValidationError("Subtitle stream count changed unexpectedly")
+    for index, (before, after) in enumerate(zip(before_subtitles, after_subtitles)):
+        if str(before.get("codec_name")) != str(after.get("codec_name")):
+            raise RepairValidationError(f"Subtitle stream {index} codec changed unexpectedly")
+
+    before_chapters = original.info.get("chapters") or []
+    after_chapters = fixed.info.get("chapters") or []
+    if original.chapter_issue:
+        if after_chapters:
+            raise RepairValidationError("Chapters remain after invalid chapter removal")
+    elif len(before_chapters) != len(after_chapters):
+        raise RepairValidationError("Valid chapter count changed unexpectedly")
 
 
 def validate_decode(repaired: Path, duration: float, job: Path) -> None:
@@ -315,8 +371,8 @@ def safe_replace(original: Path, repaired: Path, original_analysis: Analysis) ->
             f"available {media_free / 1024**3:.1f} GiB"
         )
     token = uuid.uuid4().hex
-    stage = original.parent / f"TimestampRepairStage-{token}.mp4"
-    backup = original.parent / f"TimestampRepairBackup-{token}.mp4"
+    stage = original.parent / f"MediaRepairStage-{token}.mp4"
+    backup = original.parent / f"MediaRepairBackup-{token}.mp4"
     original_stat = original.stat()
     installed = False
     try:
@@ -340,8 +396,7 @@ def safe_replace(original: Path, repaired: Path, original_analysis: Analysis) ->
             os.replace(stage, original)
             installed = True
             final = analyze(original)
-            if final.status != "Healthy" or final.different <= 0:
-                raise RepairValidationError(f"Post-install timestamp validation failed: {final.reason}")
+            compare_streams(original_analysis, final)
         except Exception:
             if installed and original.exists():
                 original.unlink()
@@ -367,76 +422,64 @@ def repair_one(path: Path, original: Analysis) -> tuple[str, int]:
     repaired = job / "repaired.mp4"
     success = False
     try:
-        nominal_fps = str(original.video.get("r_frame_rate") or original.video.get("avg_frame_rate"))
-        LOG.info("Extracting H.264 without re-encoding: %s", path)
-        run_logged(
-            [
-                FFMPEG,
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                "-y",
-                "-i",
-                str(path),
-                "-map",
-                "0:v:0",
-                "-c:v",
-                "copy",
-                "-bsf:v",
-                "h264_mp4toannexb",
-                "-f",
-                "h264",
-                str(raw),
-            ],
-            job / "extract",
-            "H.264 extraction",
-        )
-        LOG.info("Rebuilding composition timestamps: %s", path)
-        run_logged(
-            [MP4BOX, "-tmp", str(job), "-add", f"{raw}:fps={nominal_fps}", "-new", str(video_only)],
-            job / "mp4box",
-            "MP4Box timestamp rebuild",
-        )
-        if not KEEP_TEMP_ON_FAILURE:
-            raw.unlink(missing_ok=True)
+        if original.timestamp_issue:
+            nominal_fps = str(original.video.get("r_frame_rate") or original.video.get("avg_frame_rate"))
+            LOG.info("Extracting H.264 without re-encoding: %s", path)
+            run_logged(
+                [
+                    FFMPEG,
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "warning",
+                    "-y",
+                    "-i",
+                    str(path),
+                    "-map",
+                    "0:v:0",
+                    "-c:v",
+                    "copy",
+                    "-bsf:v",
+                    "h264_mp4toannexb",
+                    "-f",
+                    "h264",
+                    str(raw),
+                ],
+                job / "extract",
+                "H.264 extraction",
+            )
+            LOG.info("Rebuilding composition timestamps: %s", path)
+            run_logged(
+                [MP4BOX, "-tmp", str(job), "-add", f"{raw}:fps={nominal_fps}", "-new", str(video_only)],
+                job / "mp4box",
+                "MP4Box timestamp rebuild",
+            )
+            if not KEEP_TEMP_ON_FAILURE:
+                raw.unlink(missing_ok=True)
 
-        LOG.info("Copying audio, subtitles, chapters and metadata: %s", path)
-        run_logged(
-            [
-                FFMPEG,
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                "-y",
-                "-i",
-                str(video_only),
-                "-i",
-                str(path),
-                "-map",
-                "0:v:0",
-                "-map",
-                "1:a?",
-                "-map",
-                "1:s?",
-                "-c",
-                "copy",
-                "-map_metadata",
-                "1",
-                "-map_chapters",
-                "1",
-                "-map_metadata:s:v:0",
-                "1:s:v:0",
-                "-movflags",
-                "+faststart",
-                "-avoid_negative_ts",
-                "disabled",
-                str(repaired),
-            ],
-            job / "remux",
-            "final remux",
+        LOG.info(
+            "%s: %s",
+            "Removing invalid full-duration chapter" if original.chapter_issue else "Preserving valid chapters",
+            path,
         )
+        remux = [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "warning", "-y"]
+        if original.timestamp_issue:
+            remux.extend([
+                "-i", str(video_only), "-i", str(path),
+                "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
+                "-map_metadata", "1", "-map_metadata:s:v:0", "1:s:v:0",
+                "-map_chapters", "-1" if original.chapter_issue else "1",
+            ])
+        else:
+            remux.extend([
+                "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
+                "-map_metadata", "0", "-map_metadata:s:v:0", "0:s:v:0",
+                "-map_chapters", "-1" if original.chapter_issue else "0",
+            ])
+        remux.extend([
+            "-c", "copy", "-movflags", "+faststart", "-avoid_negative_ts", "disabled", str(repaired),
+        ])
+        run_logged(remux, job / "remux", "final remux")
         fixed = analyze(repaired)
         compare_streams(original, fixed)
         duration = float(fixed.info.get("format", {}).get("duration", 0.0) or 0.0)
@@ -1000,6 +1043,8 @@ def process_pending(state: State, runtime: Runtime, row: sqlite3.Row) -> None:
                 )
             else:
                 try:
+                    repaired_timestamp = result.timestamp_issue
+                    repaired_chapter = result.chapter_issue
                     final_hash, dropped_data = repair_one(path, result)
                 except RepairValidationError as exc:
                     result = Analysis(
@@ -1009,9 +1054,15 @@ def process_pending(state: State, runtime: Runtime, row: sqlite3.Row) -> None:
                 else:
                     stat = path.stat()
                     remember_internal_change(path, stat)
+                    completed = []
+                    if repaired_timestamp:
+                        completed.append("composition timestamps rebuilt")
+                    if repaired_chapter:
+                        completed.append("invalid full-duration chapter removed")
                     result = Analysis(
                         "Repaired",
-                        "Composition timestamps rebuilt without video re-encoding; original replaced after validation",
+                        "; ".join(completed)
+                        + "; streams copied without re-encoding and original replaced after validation",
                         result.info, result.video, result.comparable, result.different,
                     )
         state.save(path, stat, result.status, result.reason, result.comparable, result.different, dropped_data, final_hash)
@@ -1113,6 +1164,7 @@ def main() -> int:
                 show_full_paths=WEB_SHOW_FULL_PATHS,
                 settings={
                     "auto_repair": AUTO_REPAIR,
+                    "repair_empty_full_chapters": REPAIR_EMPTY_FULL_CHAPTERS,
                     "file_settle_seconds": FILE_SETTLE_SECONDS,
                     "min_file_age_seconds": MIN_FILE_AGE,
                     "reconcile_local_time": RECONCILE_LOCAL_TIME,
@@ -1123,7 +1175,10 @@ def main() -> int:
         except Exception:
             LOG.exception("Web UI failed to start; repair service will continue without it")
 
-    LOG.info("Service 2.0 started: media=%s auto_repair=%s reconcile=%s", MEDIA_ROOT, AUTO_REPAIR, RECONCILE_LOCAL_TIME)
+    LOG.info(
+        "Service 2.1 started: media=%s auto_repair=%s empty_full_chapters=%s reconcile=%s",
+        MEDIA_ROOT, AUTO_REPAIR, REPAIR_EMPTY_FULL_CHAPTERS, RECONCILE_LOCAL_TIME,
+    )
     try:
         reconcile(state, runtime)
         while not STOP_REQUESTED:

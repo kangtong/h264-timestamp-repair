@@ -128,6 +128,50 @@ class MigrationTests(unittest.TestCase):
 
 
 class UtilityTests(unittest.TestCase):
+    @staticmethod
+    def media_info_with_chapter(*, title: str = "", start: float = 0.0, end: float = 100.0) -> dict:
+        return {
+            "format": {"duration": "100.0"},
+            "streams": [{
+                "codec_type": "video", "codec_name": "h264", "has_b_frames": 1,
+                "profile": "High", "width": 1920, "height": 1080, "pix_fmt": "yuv420p",
+                "avg_frame_rate": "30000/1001", "r_frame_rate": "30000/1001",
+                "disposition": {"attached_pic": 0},
+            }],
+            "chapters": [{
+                "start_time": str(start), "end_time": str(end), "tags": {"title": title},
+            }],
+        }
+
+    def test_detects_only_untitled_chapter_spanning_the_complete_file(self) -> None:
+        self.assertTrue(service.has_empty_full_duration_chapter(self.media_info_with_chapter()))
+        self.assertFalse(service.has_empty_full_duration_chapter(self.media_info_with_chapter(title="Feature")))
+        self.assertFalse(service.has_empty_full_duration_chapter(self.media_info_with_chapter(start=5.0)))
+        self.assertFalse(service.has_empty_full_duration_chapter(self.media_info_with_chapter(end=80.0)))
+        multiple = self.media_info_with_chapter()
+        multiple["chapters"].append(dict(multiple["chapters"][0]))
+        self.assertFalse(service.has_empty_full_duration_chapter(multiple))
+
+    def test_analysis_reports_timestamp_and_chapter_problems_independently(self) -> None:
+        info = self.media_info_with_chapter()
+        with mock.patch.object(service, "media_info", return_value=info), mock.patch.object(
+            service, "timestamp_sample", return_value=(60, 0),
+        ):
+            result = service.analyze(Path("sample.mp4"))
+        self.assertEqual("Candidate", result.status)
+        self.assertTrue(result.timestamp_issue)
+        self.assertTrue(result.chapter_issue)
+
+        info["streams"][0]["codec_name"] = "hevc"
+        with mock.patch.object(service, "media_info", return_value=info), mock.patch.object(
+            service, "timestamp_sample",
+        ) as sample:
+            result = service.analyze(Path("sample.mp4"))
+        self.assertEqual("Candidate", result.status)
+        self.assertFalse(result.timestamp_issue)
+        self.assertTrue(result.chapter_issue)
+        sample.assert_not_called()
+
     def test_error_is_plain_and_bounded(self) -> None:
         value = "\x1b[31m" + "x" * 10000
         compact = service.compact_error(value)
@@ -141,7 +185,7 @@ class UtilityTests(unittest.TestCase):
     def test_deterministic_repair_validation_uses_distinct_error(self) -> None:
         original = service.Analysis(
             "Candidate", "missing timestamps", {"streams": []},
-            {"codec_name": "h264"}, 60, 0,
+            {"codec_name": "h264"}, 60, 0, timestamp_issue=True,
         )
         fixed = service.Analysis(
             "Candidate", "timestamps still missing", {"streams": []},
