@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
-"""Read-only authenticated web dashboard for the timestamp repair service."""
+"""Anonymous read-only web dashboard for the timestamp repair service."""
 
 from __future__ import annotations
 
-import base64
-import csv
-import hmac
-import io
 import json
 import logging
-import os
-import secrets
 import sqlite3
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,31 +23,10 @@ def _display_path(value: str, show_full_paths: bool) -> str:
     return value if show_full_paths else Path(value).name
 
 
-def _load_or_create_password(config_root: Path, configured: str) -> tuple[str, Path | None, bool]:
-    if configured:
-        return configured, None, False
-    target = config_root / "web-password.txt"
-    if target.exists():
-        existing = target.read_text(encoding="utf-8").strip()
-        if existing:
-            return existing, target, False
-    password = secrets.token_urlsafe(18)
-    temporary = target.with_suffix(".tmp")
-    temporary.write_text(password + "\n", encoding="utf-8")
-    try:
-        os.chmod(temporary, 0o600)
-    except OSError:
-        pass
-    os.replace(temporary, target)
-    return password, target, True
-
-
 @dataclass
 class WebService:
     server: ThreadingHTTPServer
     thread: threading.Thread
-    username: str
-    password_file: Path | None
 
     @property
     def port(self) -> int:
@@ -70,23 +42,19 @@ def start_web_server(
     config_root: Path,
     host: str,
     port: int,
-    username: str,
-    password: str,
     show_full_paths: bool,
     settings: dict[str, Any],
 ) -> WebService:
-    """Start the dashboard in a daemon thread and return its lifecycle handle."""
-    resolved_password, password_file, generated = _load_or_create_password(config_root, password)
+    """Start the anonymous, read-only dashboard."""
     static_root = Path(__file__).resolve().parent / "web"
     if not static_root.is_dir():
         raise RuntimeError(f"Web assets directory is missing: {static_root}")
 
     state_path = config_root / "state.sqlite3"
     heartbeat_path = config_root / "heartbeat.json"
-    history_path = config_root / "history.jsonl"
 
     class DashboardHandler(BaseHTTPRequestHandler):
-        server_version = "H264TimestampRepair/1.1"
+        server_version = "H264TimestampRepair/2.0"
 
         def log_message(self, format_text: str, *args: Any) -> None:
             LOG.debug("%s - %s", self.address_string(), format_text % args)
@@ -98,7 +66,6 @@ def start_web_server(
             length: int,
             *,
             cache: str = "no-store",
-            disposition: str | None = None,
         ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -112,8 +79,6 @@ def start_web_server(
                 "default-src 'self'; img-src 'self' data:; style-src 'self'; "
                 "script-src 'self'; connect-src 'self'; frame-ancestors 'none'",
             )
-            if disposition:
-                self.send_header("Content-Disposition", disposition)
             self.end_headers()
 
         def _send_bytes(
@@ -123,39 +88,16 @@ def start_web_server(
             status: int = HTTPStatus.OK,
             *,
             cache: str = "no-store",
-            disposition: str | None = None,
         ) -> None:
-            self._send_headers(status, content_type, len(payload), cache=cache, disposition=disposition)
-            self.wfile.write(payload)
+            self._send_headers(status, content_type, len(payload), cache=cache)
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def _send_json(self, payload: Any, status: int = HTTPStatus.OK) -> None:
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             self._send_bytes(body, "application/json; charset=utf-8", status)
-
-        def _authorized(self) -> bool:
-            header = self.headers.get("Authorization", "")
-            if not header.startswith("Basic "):
-                return False
-            try:
-                decoded = base64.b64decode(header[6:], validate=True).decode("utf-8")
-            except (ValueError, UnicodeDecodeError):
-                return False
-            expected = f"{username}:{resolved_password}"
-            return hmac.compare_digest(decoded, expected)
-
-        def _require_auth(self) -> bool:
-            if self._authorized():
-                return True
-            body = b"Authentication required\n"
-            self.send_response(HTTPStatus.UNAUTHORIZED)
-            self.send_header("WWW-Authenticate", 'Basic realm="H.264 Timestamp Repair", charset="UTF-8"')
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            self.wfile.write(body)
-            return False
 
         def _connect(self) -> sqlite3.Connection | None:
             if not state_path.exists():
@@ -171,9 +113,10 @@ def start_web_server(
             if connection is None:
                 return {"total": 0}
             try:
-                rows = connection.execute("SELECT status, COUNT(*) AS count FROM files GROUP BY status").fetchall()
+                rows = connection.execute("SELECT status,COUNT(*) AS count FROM files GROUP BY status").fetchall()
                 result = {str(row["status"]): int(row["count"]) for row in rows}
                 result["total"] = sum(result.values())
+                result["pending"] = int(connection.execute("SELECT COUNT(*) FROM pending").fetchone()[0])
                 return result
             finally:
                 connection.close()
@@ -196,12 +139,10 @@ def start_web_server(
                     age = max(0.0, time.time() - float(heartbeat["time"]))
                 except (TypeError, ValueError):
                     age = None
-            scan_interval = int(settings.get("scan_interval_seconds", 1800))
-            healthy_age = max(1800, scan_interval * 2 + 1800)
             return {
                 "now": time.time(),
                 "heartbeat_age_seconds": age,
-                "service_healthy": age is not None and age <= healthy_age,
+                "service_healthy": age is not None and age <= 600,
                 "heartbeat": heartbeat,
                 "summary": self._summary(),
                 "config": settings,
@@ -234,7 +175,7 @@ def start_web_server(
                 total = int(connection.execute("SELECT COUNT(*) FROM files" + where, params).fetchone()[0])
                 rows = connection.execute(
                     "SELECT path,status,reason,checked_at,comparable,different,dropped_data "
-                    "FROM files" + where + " ORDER BY checked_at DESC, path LIMIT ? OFFSET ?",
+                    "FROM files" + where + " ORDER BY checked_at DESC,path LIMIT ? OFFSET ?",
                     [*params, limit, offset],
                 ).fetchall()
                 items = []
@@ -251,93 +192,53 @@ def start_web_server(
                 limit = min(200, max(1, int(query.get("limit", ["30"])[0])))
             except ValueError:
                 limit = 30
-            if not history_path.exists():
-                return {"items": []}
-            recent: deque[str] = deque(maxlen=limit)
-            with history_path.open("r", encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    if line.strip():
-                        recent.append(line)
-            items = []
-            for line in reversed(recent):
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                items.append(
-                    {
-                        "time": event.get("time", ""),
-                        "path": _display_path(str(event.get("path", "")), show_full_paths),
-                        "status": event.get("status", ""),
-                        "reason": event.get("reason", ""),
-                    }
-                )
-            return {"items": items}
-
-        def _report_csv(self) -> bytes:
-            output = io.StringIO(newline="")
-            writer = csv.writer(output)
-            writer.writerow(
-                ["path", "status", "reason", "checked_at", "comparable", "different", "dropped_data", "sha256"]
-            )
             connection = self._connect()
-            if connection is not None:
-                try:
-                    rows = connection.execute(
-                        "SELECT path,status,reason,checked_at,comparable,different,dropped_data,sha256 "
-                        "FROM files ORDER BY path"
-                    ).fetchall()
-                    for row in rows:
-                        values = list(row)
-                        values[0] = _display_path(str(values[0]), show_full_paths)
-                        writer.writerow(values)
-                finally:
-                    connection.close()
-            return ("\ufeff" + output.getvalue()).encode("utf-8")
+            if connection is None:
+                return {"items": []}
+            try:
+                rows = connection.execute(
+                    "SELECT event_time,path,status,reason FROM events ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                return {
+                    "items": [
+                        {
+                            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(row["event_time"])),
+                            "path": _display_path(str(row["path"]), show_full_paths) if row["path"] else "",
+                            "status": row["status"], "reason": row["reason"],
+                        }
+                        for row in rows
+                    ]
+                }
+            finally:
+                connection.close()
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-            if not self._require_auth():
-                return
-            parsed = urlparse(self.path)
-            path = parsed.path
-            query = parse_qs(parsed.query, keep_blank_values=True)
-            if path in {"/", "/index.html"}:
-                payload = (static_root / "index.html").read_bytes()
-                self._send_bytes(payload, "text/html; charset=utf-8", cache="no-cache")
-            elif path == "/assets/style.css":
-                self._send_bytes(
-                    (static_root / "style.css").read_bytes(),
-                    "text/css; charset=utf-8",
-                    cache="public, max-age=300",
-                )
-            elif path == "/assets/app.js":
-                self._send_bytes(
-                    (static_root / "app.js").read_bytes(),
-                    "text/javascript; charset=utf-8",
-                    cache="public, max-age=300",
-                )
-            elif path == "/api/status":
-                self._send_json(self._status_payload())
-            elif path == "/api/files":
-                self._send_json(self._files_payload(query))
-            elif path == "/api/history":
-                self._send_json(self._history_payload(query))
-            elif path == "/report.csv":
-                self._send_bytes(
-                    self._report_csv(),
-                    "text/csv; charset=utf-8",
-                    disposition='attachment; filename="h264-timestamp-report.csv"',
-                )
-            else:
-                self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            try:
+                parsed = urlparse(self.path)
+                path = parsed.path
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                if path in {"/", "/index.html"}:
+                    self._send_bytes((static_root / "index.html").read_bytes(), "text/html; charset=utf-8", cache="no-cache")
+                elif path == "/assets/style.css":
+                    self._send_bytes((static_root / "style.css").read_bytes(), "text/css; charset=utf-8", cache="public,max-age=300")
+                elif path == "/assets/app.js":
+                    self._send_bytes((static_root / "app.js").read_bytes(), "text/javascript; charset=utf-8", cache="public,max-age=300")
+                elif path == "/api/status":
+                    self._send_json(self._status_payload())
+                elif path == "/api/files":
+                    self._send_json(self._files_payload(query))
+                elif path == "/api/history":
+                    self._send_json(self._history_payload(query))
+                else:
+                    self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                LOG.exception("Dashboard request failed")
+                self._send_json({"error": "dashboard data is temporarily unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
 
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, name="timestamp-repair-web", daemon=True)
     thread.start()
-    LOG.info("Web UI listening on http://%s:%s", host, server.server_address[1])
-    if generated and password_file:
-        LOG.warning("Generated Web UI password for user %s; read it from %s", username, password_file)
-    elif password_file:
-        LOG.info("Using persisted Web UI password from %s", password_file)
-    return WebService(server=server, thread=thread, username=username, password_file=password_file)
+    LOG.warning("Anonymous Web UI listening on http://%s:%s; do not expose it directly to the Internet", host, server.server_address[1])
+    return WebService(server=server, thread=thread)

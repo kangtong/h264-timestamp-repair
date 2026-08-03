@@ -53,13 +53,11 @@ function renderStatus(data) {
   $("count-failed").textContent = summary.Failed ?? 0;
 
   const heartbeat = data.heartbeat || {};
-  const total = Number(heartbeat.files_seen || 0);
-  const current = Number(heartbeat.current_index || 0);
-  const complete = Boolean(heartbeat.cycle_complete);
-  const ratio = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : (complete ? 100 : 0);
-  $("progress-bar").style.width = `${ratio}%`;
-  $("progress-text").textContent = total ? `${current} / ${total} · ${ratio}%` : (complete ? "本轮已完成" : "等待首次扫描");
-  $("current-file").textContent = heartbeat.current_path || (complete ? "本轮扫描完成" : "—");
+  const pending = Number(heartbeat.pending_count ?? summary.pending ?? 0);
+  const active = Boolean(heartbeat.current_path);
+  $("progress-bar").style.width = active ? "45%" : (pending ? "15%" : "100%");
+  $("progress-text").textContent = pending ? `${pending} 个文件` : "队列为空";
+  $("current-file").textContent = heartbeat.current_path || (heartbeat.current_action === "reconcile" ? "正在校准元数据" : "—");
   $("heartbeat-age").textContent = formatAge(data.heartbeat_age_seconds);
 
   const alive = Boolean(data.service_healthy);
@@ -68,7 +66,9 @@ function renderStatus(data) {
   state.innerHTML = "";
   const dot = document.createElement("span");
   dot.className = "state-dot";
-  state.append(dot, document.createTextNode(alive ? "服务在线" : "状态过期"));
+  const watching = Boolean(heartbeat.watcher_active);
+  state.append(dot, document.createTextNode(alive ? (watching ? "监听正常" : "降级运行") : "状态过期"));
+  state.title = heartbeat.watcher_error || "";
 
   const autoRepair = Boolean(heartbeat.auto_repair ?? data.config?.auto_repair);
   const mode = $("mode-pill");
@@ -76,7 +76,8 @@ function renderStatus(data) {
   mode.className = `mode-pill ${autoRepair ? "repair" : "scan"}`;
 
   const config = data.config || {};
-  $("config-interval").textContent = formatSeconds(config.scan_interval_seconds);
+  $("config-reconcile").textContent = `每天 ${config.reconcile_local_time || "04:00"}`;
+  $("config-settle").textContent = formatSeconds(config.file_settle_seconds);
   $("config-min-age").textContent = formatSeconds(config.min_file_age_seconds);
   $("config-filter").textContent = config.name_filter_enabled ? "已启用" : "未启用（全部 MP4）";
   $("config-paths").textContent = config.show_full_paths ? "完整路径" : "仅文件名（脱敏）";

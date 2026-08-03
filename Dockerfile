@@ -8,7 +8,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/config
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -16,6 +17,7 @@ RUN apt-get update \
         ffmpeg \
         gpac \
         python3 \
+        python3-watchdog \
         tzdata \
     && rm -rf /var/lib/apt/lists/*
 

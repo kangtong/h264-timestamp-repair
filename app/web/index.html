@@ -31,12 +31,12 @@
 
       <section class="panel progress-panel">
         <div class="panel-heading">
-          <div><p class="section-kicker">CURRENT CYCLE</p><h2>扫描进度</h2></div>
+          <div><p class="section-kicker">INCREMENTAL QUEUE</p><h2>增量处理</h2></div>
           <span id="mode-pill" class="mode-pill">—</span>
         </div>
-        <div class="progress-track" aria-label="当前扫描进度"><div id="progress-bar" class="progress-bar"></div></div>
+        <div class="progress-track" aria-label="增量队列状态"><div id="progress-bar" class="progress-bar"></div></div>
         <div class="progress-meta">
-          <div><span>进度</span><strong id="progress-text">等待状态</strong></div>
+          <div><span>待处理</span><strong id="progress-text">等待状态</strong></div>
           <div><span>当前文件</span><strong id="current-file">—</strong></div>
           <div><span>上次心跳</span><strong id="heartbeat-age">—</strong></div>
         </div>
@@ -45,7 +45,6 @@
       <section class="panel">
         <div class="panel-heading table-heading">
           <div><p class="section-kicker">MEDIA STATUS</p><h2>文件结果</h2></div>
-          <a class="button secondary" href="/report.csv">下载脱敏 CSV</a>
         </div>
         <div class="toolbar">
           <label class="search-field"><span>搜索</span><input id="search-input" type="search" placeholder="文件名或原因" autocomplete="off"></label>
@@ -68,12 +67,13 @@
         <article class="panel">
           <div class="panel-heading"><div><p class="section-kicker">RUNTIME</p><h2>运行配置</h2></div></div>
           <dl class="config-list">
-            <div><dt>扫描间隔</dt><dd id="config-interval">—</dd></div>
+            <div><dt>每日校准</dt><dd id="config-reconcile">—</dd></div>
+            <div><dt>文件静默期</dt><dd id="config-settle">—</dd></div>
             <div><dt>最小文件年龄</dt><dd id="config-min-age">—</dd></div>
             <div><dt>文件名过滤</dt><dd id="config-filter">—</dd></div>
             <div><dt>路径显示</dt><dd id="config-paths">—</dd></div>
           </dl>
-          <p class="security-note">界面只提供读取功能，不包含修改、删除或手动修复操作。</p>
+          <p class="security-note">匿名只读界面；请仅在可信局域网中开放，不要直接暴露到互联网。</p>
         </article>
       </section>
     </main>

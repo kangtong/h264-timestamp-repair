@@ -4,24 +4,35 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import logging
 import os
+import queue
+import re
 import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from web_ui import WebService, start_web_server
+
+try:
+    from watchdog.events import FileSystemEvent, FileSystemEventHandler
+    from watchdog.observers import Observer
+except ImportError:  # pragma: no cover - covered by container integration
+    FileSystemEvent = Any  # type: ignore[assignment,misc]
+    FileSystemEventHandler = object  # type: ignore[assignment,misc]
+    Observer = None  # type: ignore[assignment]
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -36,25 +47,30 @@ CONFIG_ROOT = Path(os.getenv("CONFIG_ROOT", "/config"))
 WORK_ROOT = Path(os.getenv("WORK_ROOT", "/work"))
 NAME_CONTAINS = os.getenv("NAME_CONTAINS", "")
 AUTO_REPAIR = env_bool("AUTO_REPAIR", False)
-SCAN_INTERVAL = max(60, int(os.getenv("SCAN_INTERVAL_SECONDS", "1800")))
 MIN_FILE_AGE = max(0, int(os.getenv("MIN_FILE_AGE_SECONDS", "3600")))
-STABLE_SCANS = max(1, int(os.getenv("STABLE_SCANS", "1")))
+FILE_SETTLE_SECONDS = max(1, int(os.getenv("FILE_SETTLE_SECONDS", "60")))
+RECONCILE_LOCAL_TIME = os.getenv("RECONCILE_LOCAL_TIME", "04:00").strip()
 SAMPLE_SECONDS = max(3, int(os.getenv("SAMPLE_SECONDS", "8")))
 MINIMUM_PACKETS = max(20, int(os.getenv("MINIMUM_PACKETS", "60")))
 RETRY_FAILED_AFTER = max(300, int(os.getenv("RETRY_FAILED_AFTER_SECONDS", "86400")))
 KEEP_TEMP_ON_FAILURE = env_bool("KEEP_TEMP_ON_FAILURE", False)
+EVENT_HISTORY_LIMIT = max(100, int(os.getenv("EVENT_HISTORY_LIMIT", "5000")))
 FFMPEG = os.getenv("FFMPEG_BIN", "ffmpeg")
 FFPROBE = os.getenv("FFPROBE_BIN", "ffprobe")
 MP4BOX = os.getenv("MP4BOX_BIN", "MP4Box")
 WEB_UI_ENABLED = env_bool("WEB_UI_ENABLED", True)
 WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")
 WEB_UI_PORT = min(65535, max(1, int(os.getenv("WEB_UI_PORT", "8080"))))
-WEB_USERNAME = os.getenv("WEB_USERNAME", "admin").strip() or "admin"
-WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
 WEB_SHOW_FULL_PATHS = env_bool("WEB_SHOW_FULL_PATHS", False)
+ANALYSIS_SIGNATURE = f"2:{SAMPLE_SECONDS}:{MINIMUM_PACKETS}"
+LEGACY_ENV_NAMES = ("SCAN_INTERVAL_SECONDS", "STABLE_SCANS", "WEB_USERNAME", "WEB_PASSWORD")
+MAX_ERROR_LENGTH = 4096
 
 STOP_REQUESTED = False
 CURRENT_CHILD: subprocess.Popen[str] | None = None
+WAKE_EVENT = threading.Event()
+INTERNAL_IDENTITIES: dict[str, tuple[tuple[int, ...], float]] = {}
+INTERNAL_IDENTITIES_LOCK = threading.Lock()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,6 +93,7 @@ class Analysis:
 def request_stop(signum: int, _frame: Any) -> None:
     global STOP_REQUESTED
     STOP_REQUESTED = True
+    WAKE_EVENT.set()
     LOG.warning("Stop requested by signal %s; finishing the current safe operation.", signum)
 
 
@@ -96,8 +113,15 @@ def run_logged(args: list[str], log_base: Path, label: str) -> None:
         code = CURRENT_CHILD.wait()
         CURRENT_CHILD = None
     if code != 0:
-        details = stderr_path.read_text(encoding="utf-8", errors="replace")
-        raise RuntimeError(f"{label} failed (exit {code}): {details.strip()}")
+        with stderr_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            length = handle.tell()
+            handle.seek(max(0, length - 16 * 1024))
+            details = handle.read().decode("utf-8", errors="replace")
+        details = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", details).strip()
+        if length > 16 * 1024:
+            details = "[earlier tool output omitted]\n" + details
+        raise RuntimeError(f"{label} failed (exit {code}): {details}"[:MAX_ERROR_LENGTH])
 
 
 def media_info(path: Path) -> dict[str, Any]:
@@ -279,6 +303,13 @@ def validate_decode(repaired: Path, duration: float, job: Path) -> None:
 
 
 def safe_replace(original: Path, repaired: Path, original_analysis: Analysis) -> str:
+    required_media_space = repaired.stat().st_size + 256 * 1024 * 1024
+    media_free = shutil.disk_usage(original.parent).free
+    if media_free < required_media_space:
+        raise RuntimeError(
+            f"Insufficient media volume space: need about {required_media_space / 1024**3:.1f} GiB, "
+            f"available {media_free / 1024**3:.1f} GiB"
+        )
     token = uuid.uuid4().hex
     stage = original.parent / f"TimestampRepairStage-{token}.mp4"
     backup = original.parent / f"TimestampRepairBackup-{token}.mp4"
@@ -359,7 +390,7 @@ def repair_one(path: Path, original: Analysis) -> tuple[str, int]:
         )
         LOG.info("Rebuilding composition timestamps: %s", path)
         run_logged(
-            [MP4BOX, "-add", f"{raw}:fps={nominal_fps}", "-new", str(video_only)],
+            [MP4BOX, "-tmp", str(job), "-add", f"{raw}:fps={nominal_fps}", "-new", str(video_only)],
             job / "mp4box",
             "MP4Box timestamp rebuild",
         )
@@ -419,33 +450,25 @@ def repair_one(path: Path, original: Analysis) -> tuple[str, int]:
 
 
 class State:
+    TERMINAL = {"Healthy", "Skipped", "Uncertain", "Repaired"}
+
     def __init__(self, path: Path):
         self.path = path
+        migrate_legacy_state(path)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
-        self.db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS files (
-                path TEXT PRIMARY KEY,
-                size INTEGER NOT NULL,
-                mtime_ns INTEGER NOT NULL,
-                stable_count INTEGER NOT NULL DEFAULT 1,
-                status TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                checked_at REAL NOT NULL,
-                comparable INTEGER NOT NULL DEFAULT 0,
-                different INTEGER NOT NULL DEFAULT 0,
-                dropped_data INTEGER NOT NULL DEFAULT 0,
-                sha256 TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        self.db.commit()
+        create_schema(self.db)
+
+    def close(self) -> None:
+        self.db.close()
 
     def get(self, path: Path) -> sqlite3.Row | None:
         return self.db.execute("SELECT * FROM files WHERE path = ?", (str(path),)).fetchone()
+
+    def all_files(self) -> dict[str, sqlite3.Row]:
+        return {str(row["path"]): row for row in self.db.execute("SELECT * FROM files")}
 
     def save(
         self,
@@ -453,179 +476,552 @@ class State:
         stat: os.stat_result,
         status: str,
         reason: str,
-        stable_count: int,
         comparable: int = 0,
         different: int = 0,
         dropped_data: int = 0,
         final_hash: str = "",
     ) -> None:
+        reason = compact_error(reason)
         self.db.execute(
             """
-            INSERT INTO files(path,size,mtime_ns,stable_count,status,reason,checked_at,comparable,different,dropped_data,sha256)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO files(
+              path,size,mtime_ns,ctime_ns,device,inode,status,reason,checked_at,
+              comparable,different,dropped_data,sha256,analysis_signature
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(path) DO UPDATE SET
-              size=excluded.size,mtime_ns=excluded.mtime_ns,stable_count=excluded.stable_count,
-              status=excluded.status,reason=excluded.reason,checked_at=excluded.checked_at,
+              size=excluded.size,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,
+              device=excluded.device,inode=excluded.inode,status=excluded.status,
+              reason=excluded.reason,checked_at=excluded.checked_at,
               comparable=excluded.comparable,different=excluded.different,
-              dropped_data=excluded.dropped_data,sha256=excluded.sha256
+              dropped_data=excluded.dropped_data,sha256=excluded.sha256,
+              analysis_signature=excluded.analysis_signature
             """,
             (
-                str(path),
-                stat.st_size,
-                stat.st_mtime_ns,
-                stable_count,
-                status,
-                reason,
-                time.time(),
-                comparable,
-                different,
-                dropped_data,
-                final_hash,
+                str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+                stat.st_dev, stat.st_ino, status, reason, time.time(), comparable,
+                different, dropped_data, final_hash, ANALYSIS_SIGNATURE,
             ),
         )
         self.db.commit()
 
-    def export_csv(self, target: Path) -> None:
-        temporary = target.with_suffix(".tmp")
-        rows = self.db.execute("SELECT * FROM files ORDER BY path").fetchall()
-        with temporary.open("w", newline="", encoding="utf-8-sig") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(rows[0].keys() if rows else ["path", "status", "reason"])
-            for row in rows:
-                writer.writerow(tuple(row))
-        os.replace(temporary, target)
+    def remove(self, path: Path) -> None:
+        value = str(path)
+        self.db.execute("DELETE FROM pending WHERE path = ?", (value,))
+        self.db.execute("DELETE FROM files WHERE path = ?", (value,))
+        self.db.commit()
 
+    def remove_tree(self, path: Path) -> None:
+        prefix = str(path).rstrip("/\\") + os.sep
+        for table in ("pending", "files"):
+            self.db.execute(
+                f"DELETE FROM {table} WHERE substr(path,1,?)=?",
+                (len(prefix), prefix),
+            )
+        self.db.commit()
 
-def record_history(path: Path, status: str, reason: str, **extra: Any) -> None:
-    event = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "path": str(path), "status": status, "reason": reason}
-    event.update(extra)
-    with (CONFIG_ROOT / "history.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    def enqueue(self, path: Path, kind: str, eligible_at: float, force: bool) -> None:
+        now = time.time()
+        self.db.execute(
+            """
+            INSERT INTO pending(path,event_kind,queued_at,eligible_at,force,attempts)
+            VALUES(?,?,?,?,?,0)
+            ON CONFLICT(path) DO UPDATE SET
+              event_kind=excluded.event_kind,queued_at=excluded.queued_at,
+              eligible_at=excluded.eligible_at,force=MAX(pending.force,excluded.force)
+            """,
+            (str(path), kind, now, eligible_at, int(force)),
+        )
+        self.db.commit()
+        WAKE_EVENT.set()
 
+    def defer(self, path: Path, eligible_at: float, *, increment: bool = False) -> None:
+        self.db.execute(
+            "UPDATE pending SET eligible_at=?, attempts=attempts+? WHERE path=?",
+            (eligible_at, int(increment), str(path)),
+        )
+        self.db.commit()
 
-def enumerate_media() -> list[Path]:
-    files = []
-    for root, directories, names in os.walk(MEDIA_ROOT):
-        directories[:] = [d for d in directories if d not in {"@eaDir", "#recycle", ".Trash"}]
-        for name in names:
-            if not name.lower().endswith(".mp4"):
-                continue
-            if name.startswith(("TimestampRepairStage-", "TimestampRepairBackup-")):
-                continue
-            if NAME_CONTAINS and NAME_CONTAINS.casefold() not in name.casefold():
-                continue
-            files.append(Path(root) / name)
-    files.sort(key=lambda p: str(p).casefold())
-    return files
+    def complete(self, path: Path) -> None:
+        self.db.execute("DELETE FROM pending WHERE path = ?", (str(path),))
+        self.db.commit()
 
+    def due(self, limit: int = 100) -> list[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT * FROM pending WHERE eligible_at <= ? ORDER BY eligible_at,path LIMIT ?",
+            (time.time(), limit),
+        ).fetchall()
 
-def should_use_cache(row: sqlite3.Row, stat: os.stat_result) -> bool:
-    unchanged = row["size"] == stat.st_size and row["mtime_ns"] == stat.st_mtime_ns
-    if not unchanged:
-        return False
-    if row["status"] in {"Healthy", "Skipped", "Uncertain", "Repaired"}:
+    def pending_count(self) -> int:
+        return int(self.db.execute("SELECT COUNT(*) FROM pending").fetchone()[0])
+
+    def next_due(self) -> float | None:
+        value = self.db.execute("SELECT MIN(eligible_at) FROM pending").fetchone()[0]
+        return float(value) if value is not None else None
+
+    def record(self, path: Path, status: str, reason: str) -> None:
+        self.db.execute(
+            "INSERT INTO events(event_time,path,status,reason) VALUES(?,?,?,?)",
+            (time.time(), str(path), status, compact_error(reason)),
+        )
+        self.db.execute(
+            "DELETE FROM events WHERE id IN "
+            "(SELECT id FROM events ORDER BY id DESC LIMIT -1 OFFSET ?)",
+            (EVENT_HISTORY_LIMIT,),
+        )
+        self.db.commit()
+
+    def meta_get(self, key: str, default: str = "") -> str:
+        row = self.db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+        return str(row[0]) if row else default
+
+    def meta_set(self, key: str, value: str) -> None:
+        self.db.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        self.db.commit()
+
+    def transfer_rename(self, source: Path, destination: Path) -> bool:
+        row = self.get(source)
+        if row is None or not destination.exists():
+            self.remove(source)
+            return False
+        stat = destination.stat()
+        same_file = (
+            row["device"] == stat.st_dev and row["inode"] == stat.st_ino
+            and row["size"] == stat.st_size and row["mtime_ns"] == stat.st_mtime_ns
+            and row["analysis_signature"] == ANALYSIS_SIGNATURE
+            and cacheable_status(str(row["status"]))
+        )
+        if not same_file:
+            self.remove(source)
+            return False
+        self.db.execute("DELETE FROM pending WHERE path IN (?,?)", (str(source), str(destination)))
+        self.db.execute("DELETE FROM files WHERE path=?", (str(destination),))
+        self.db.execute(
+            "UPDATE files SET path=?,ctime_ns=? WHERE path=?",
+            (str(destination), stat.st_ctime_ns, str(source)),
+        )
+        self.db.commit()
         return True
-    if row["status"] == "Candidate" and not AUTO_REPAIR:
+
+
+def create_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS files (
+          path TEXT PRIMARY KEY,
+          size INTEGER NOT NULL,
+          mtime_ns INTEGER NOT NULL,
+          ctime_ns INTEGER NOT NULL,
+          device INTEGER NOT NULL,
+          inode INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          checked_at REAL NOT NULL,
+          comparable INTEGER NOT NULL DEFAULT 0,
+          different INTEGER NOT NULL DEFAULT 0,
+          dropped_data INTEGER NOT NULL DEFAULT 0,
+          sha256 TEXT NOT NULL DEFAULT '',
+          analysis_signature TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
+        CREATE INDEX IF NOT EXISTS idx_files_checked ON files(checked_at DESC);
+        CREATE TABLE IF NOT EXISTS pending (
+          path TEXT PRIMARY KEY,
+          event_kind TEXT NOT NULL,
+          queued_at REAL NOT NULL,
+          eligible_at REAL NOT NULL,
+          force INTEGER NOT NULL DEFAULT 0,
+          attempts INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_due ON pending(eligible_at);
+        CREATE TABLE IF NOT EXISTS events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_time REAL NOT NULL,
+          path TEXT NOT NULL,
+          status TEXT NOT NULL,
+          reason TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time DESC);
+        CREATE TABLE IF NOT EXISTS metadata (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        """
+    )
+    connection.commit()
+
+
+def compact_error(value: str) -> str:
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(value)).strip()
+    if len(value) <= MAX_ERROR_LENGTH:
+        return value
+    return "[error output truncated]\n" + value[-(MAX_ERROR_LENGTH - 25):]
+
+
+def migrate_legacy_state(path: Path) -> None:
+    if not path.exists():
+        return
+    source = sqlite3.connect(path)
+    source.row_factory = sqlite3.Row
+    try:
+        columns = {str(row[1]) for row in source.execute("PRAGMA table_info(files)")}
+        if "analysis_signature" in columns:
+            return
+        temporary = path.with_name("state-v2.sqlite3.tmp")
+        temporary.unlink(missing_ok=True)
+        target = sqlite3.connect(temporary)
+        target.row_factory = sqlite3.Row
+        create_schema(target)
+        now = time.time()
+        rows = source.execute(
+            "SELECT path,size,mtime_ns,status,"
+            "CASE WHEN status='Failed' THEN '' ELSE substr(reason,1,4096) END AS reason,"
+            "checked_at,comparable,different,dropped_data,sha256 FROM files"
+        )
+        migrated = queued = 0
+        for row in rows:
+            media = Path(str(row["path"]))
+            try:
+                stat = media.stat()
+            except OSError:
+                continue
+            unchanged = stat.st_size == row["size"] and stat.st_mtime_ns == row["mtime_ns"]
+            status = str(row["status"])
+            if unchanged and cacheable_status(status):
+                target.execute(
+                    "INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        str(media), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+                        stat.st_dev, stat.st_ino, status, compact_error(str(row["reason"])),
+                        float(row["checked_at"]), int(row["comparable"]), int(row["different"]),
+                        int(row["dropped_data"]), str(row["sha256"]), ANALYSIS_SIGNATURE,
+                    ),
+                )
+                migrated += 1
+            else:
+                target.execute(
+                    "INSERT INTO pending VALUES(?,?,?,?,?,?)",
+                    (str(media), "migration-retry", now, now, 1, 0),
+                )
+                queued += 1
+        target.execute(
+            "INSERT INTO events(event_time,path,status,reason) VALUES(?,?,?,?)",
+            (now, "", "Migration", f"Imported {migrated} cached records; queued {queued} files"),
+        )
+        target.execute("INSERT INTO metadata VALUES('schema_version','2')")
+        target.commit()
+        integrity = target.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise RuntimeError(f"New state database failed integrity check: {integrity}")
+        target.close()
+    except Exception:
+        temporary = path.with_name("state-v2.sqlite3.tmp")
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        source.close()
+
+    os.replace(temporary, path)
+    for legacy in (
+        Path(str(path) + "-wal"), Path(str(path) + "-shm"),
+        path.parent / "history.jsonl", path.parent / "latest.csv",
+        path.parent / "latest.tmp", path.parent / "web-password.txt",
+    ):
+        legacy.unlink(missing_ok=True)
+
+
+def stat_identity(stat: os.stat_result) -> tuple[int, ...]:
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def remember_internal_change(path: Path, stat: os.stat_result) -> None:
+    with INTERNAL_IDENTITIES_LOCK:
+        INTERNAL_IDENTITIES[str(path)] = (stat_identity(stat), time.time() + 300)
+
+
+def is_expected_internal(path: Path) -> bool:
+    key = str(path)
+    with INTERNAL_IDENTITIES_LOCK:
+        entry = INTERNAL_IDENTITIES.get(key)
+        if entry is None:
+            return False
+        expected, expires = entry
+        if time.time() > expires:
+            INTERNAL_IDENTITIES.pop(key, None)
+            return False
+    try:
+        current = stat_identity(path.stat())
+    except OSError:
         return True
-    if row["status"] == "Failed" and time.time() - row["checked_at"] < RETRY_FAILED_AFTER:
+    if current == expected:
         return True
+    with INTERNAL_IDENTITIES_LOCK:
+        INTERNAL_IDENTITIES.pop(key, None)
     return False
 
 
-def write_heartbeat(
-    cycle_started: float,
-    files: int,
-    complete: bool,
-    current_index: int = 0,
-    current_path: Path | None = None,
-) -> None:
-    payload = {
-        "pid": os.getpid(),
-        "time": time.time(),
-        "cycle_started": cycle_started,
-        "files_seen": files,
-        "cycle_complete": complete,
-        "auto_repair": AUTO_REPAIR,
-        "current_index": current_index,
-        "current_path": str(current_path) if current_path else "",
-    }
+def cacheable_status(status: str) -> bool:
+    return status in State.TERMINAL or (status == "Candidate" and not AUTO_REPAIR)
+
+
+def cache_matches(row: sqlite3.Row, stat: os.stat_result) -> bool:
+    return (
+        cacheable_status(str(row["status"]))
+        and row["analysis_signature"] == ANALYSIS_SIGNATURE
+        and row["size"] == stat.st_size
+        and row["mtime_ns"] == stat.st_mtime_ns
+        and row["ctime_ns"] == stat.st_ctime_ns
+        and row["device"] == stat.st_dev
+        and row["inode"] == stat.st_ino
+    )
+
+
+def matches_media(path: Path) -> bool:
+    name = path.name
+    if not name.lower().endswith(".mp4"):
+        return False
+    if name.startswith(("TimestampRepairStage-", "TimestampRepairBackup-")):
+        return False
+    return not NAME_CONTAINS or NAME_CONTAINS.casefold() in name.casefold()
+
+
+def enumerate_media(root: Path = MEDIA_ROOT) -> list[Path]:
+    files: list[Path] = []
+    for current, directories, names in os.walk(root):
+        directories[:] = [d for d in directories if d not in {"@eaDir", "#recycle", ".Trash"}]
+        for name in names:
+            candidate = Path(current) / name
+            if matches_media(candidate):
+                files.append(candidate)
+    return files
+
+
+@dataclass(frozen=True)
+class WatchEvent:
+    kind: str
+    source: Path
+    destination: Path | None = None
+    is_directory: bool = False
+
+
+class IncrementalEventHandler(FileSystemEventHandler):
+    def __init__(self, events: queue.Queue[WatchEvent]):
+        super().__init__()
+        self.events = events
+
+    def _put(self, kind: str, event: FileSystemEvent, destination: str | None = None) -> None:
+        self.events.put(WatchEvent(kind, Path(event.src_path), Path(destination) if destination else None, event.is_directory))
+        WAKE_EVENT.set()
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        self._put("created", event)
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        if not event.is_directory:
+            self._put("modified", event)
+
+    def on_closed(self, event: FileSystemEvent) -> None:
+        if not event.is_directory:
+            self._put("closed", event)
+
+    def on_deleted(self, event: FileSystemEvent) -> None:
+        self._put("deleted", event)
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        self._put("moved", event, getattr(event, "dest_path", None))
+
+
+class Runtime:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.watcher_active = False
+        self.watcher_error = ""
+        self.current_path = ""
+        self.current_action = "idle"
+        self.last_reconcile = 0.0
+        self.next_reconcile = 0.0
+        self.processed_session = 0
+        self.pending_count = 0
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "pid": os.getpid(), "time": time.time(), "auto_repair": AUTO_REPAIR,
+                "watcher_active": self.watcher_active, "watcher_error": self.watcher_error,
+                "current_path": self.current_path, "current_action": self.current_action,
+                "last_reconcile": self.last_reconcile, "next_reconcile": self.next_reconcile,
+                "processed_session": self.processed_session, "pending_count": self.pending_count,
+            }
+
+
+def write_heartbeat(runtime: Runtime) -> None:
     target = CONFIG_ROOT / "heartbeat.json"
     temporary = target.with_suffix(".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.write_text(json.dumps(runtime.snapshot(), ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, target)
 
 
-def scan_cycle(state: State) -> None:
-    cycle_started = time.time()
-    files = enumerate_media()
-    LOG.info("Scan cycle found %d matching MP4 files (auto_repair=%s)", len(files), AUTO_REPAIR)
-    write_heartbeat(cycle_started, len(files), False)
-    for index, path in enumerate(files, start=1):
+def heartbeat_loop(runtime: Runtime) -> None:
+    while not runtime.stop_event.is_set():
+        try:
+            write_heartbeat(runtime)
+        except OSError:
+            LOG.exception("Unable to write heartbeat")
+        runtime.stop_event.wait(60)
+    try:
+        write_heartbeat(runtime)
+    except OSError:
+        pass
+
+
+def parse_reconcile_time(value: str) -> tuple[int, int]:
+    try:
+        parsed = datetime.strptime(value, "%H:%M")
+    except ValueError as exc:
+        raise RuntimeError("RECONCILE_LOCAL_TIME must use HH:MM") from exc
+    return parsed.hour, parsed.minute
+
+
+def next_reconcile_time(now: datetime | None = None) -> float:
+    now = now or datetime.now().astimezone()
+    hour, minute = parse_reconcile_time(RECONCILE_LOCAL_TIME)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target.timestamp()
+
+
+def reconcile(state: State, runtime: Runtime) -> None:
+    started = time.time()
+    with runtime.lock:
+        runtime.current_action = "reconcile"
+        runtime.current_path = ""
+    cached = state.all_files()
+    seen: set[str] = set()
+    queued = skipped = 0
+    for path in enumerate_media():
         if STOP_REQUESTED:
             break
-        write_heartbeat(cycle_started, len(files), False, index, path)
+        value = str(path)
+        seen.add(value)
         try:
             stat = path.stat()
-            row = state.get(path)
-            stable_count = 1
-            if row and row["size"] == stat.st_size and row["mtime_ns"] == stat.st_mtime_ns:
-                stable_count = int(row["stable_count"]) + 1
-            if should_use_cache(row, stat) if row else False:
-                continue
-            age = time.time() - stat.st_mtime
-            if age < MIN_FILE_AGE or stable_count < STABLE_SCANS:
-                reason = f"Waiting for file stability (age={int(age)}s, stable_scans={stable_count})"
-                state.save(path, stat, "WaitingStable", reason, stable_count)
-                continue
+        except OSError:
+            continue
+        row = cached.get(value)
+        if row is not None and cache_matches(row, stat):
+            skipped += 1
+            continue
+        state.enqueue(path, "reconcile", time.time(), False)
+        queued += 1
+    for value in set(cached) - seen:
+        state.remove(Path(value))
+    state.meta_set("last_reconcile", str(started))
+    with runtime.lock:
+        runtime.last_reconcile = started
+        runtime.next_reconcile = next_reconcile_time()
+        runtime.current_action = "idle"
+        runtime.pending_count = state.pending_count()
+    LOG.info("Metadata reconciliation complete: cached=%d queued=%d", skipped, queued)
 
-            LOG.info("[%d/%d] Inspecting %s", index, len(files), path)
-            result = analyze(path)
-            dropped_data = sum(1 for s in result.info.get("streams", []) if s.get("codec_type") == "data")
-            final_hash = ""
-            if result.status == "Candidate" and AUTO_REPAIR:
-                final_hash, dropped_data = repair_one(path, result)
-                stat = path.stat()
-                result = Analysis(
-                    "Repaired",
-                    "Composition timestamps rebuilt without video re-encoding; original replaced after validation",
-                    result.info,
-                    result.video,
-                    result.comparable,
-                    result.different,
-                )
-            state.save(
-                path,
-                stat,
-                result.status,
-                result.reason,
-                stable_count,
-                result.comparable,
-                result.different,
-                dropped_data,
-                final_hash,
+
+def drain_events(state: State, events: queue.Queue[WatchEvent]) -> None:
+    while True:
+        try:
+            event = events.get_nowait()
+        except queue.Empty:
+            return
+        if not event.is_directory and (is_expected_internal(event.source) or (event.destination is not None and is_expected_internal(event.destination))):
+            continue
+        if event.kind == "deleted":
+            if event.is_directory:
+                state.remove_tree(event.source)
+            else:
+                state.remove(event.source)
+            continue
+        if event.kind == "moved" and event.destination is not None:
+            if event.is_directory:
+                for media in enumerate_media(event.destination):
+                    state.enqueue(media, "directory-moved", time.time() + FILE_SETTLE_SECONDS, True)
+                continue
+            if matches_media(event.source):
+                if matches_media(event.destination) and state.transfer_rename(event.source, event.destination):
+                    continue
+                state.remove(event.source)
+            if matches_media(event.destination):
+                state.enqueue(event.destination, "moved", time.time() + FILE_SETTLE_SECONDS, True)
+            continue
+        if event.is_directory:
+            if event.kind == "created" and event.source.exists():
+                for media in enumerate_media(event.source):
+                    state.enqueue(media, "directory-created", time.time() + FILE_SETTLE_SECONDS, True)
+            continue
+        if matches_media(event.source):
+            state.enqueue(event.source, event.kind, time.time() + FILE_SETTLE_SECONDS, True)
+
+
+def process_pending(state: State, runtime: Runtime, row: sqlite3.Row) -> None:
+    path = Path(str(row["path"]))
+    with runtime.lock:
+        runtime.current_action = "process"
+        runtime.current_path = str(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        state.remove(path)
+        return
+    cached = state.get(path)
+    if not bool(row["force"]) and cached is not None and cache_matches(cached, stat):
+        state.complete(path)
+        return
+    eligible = max(float(row["eligible_at"]), stat.st_mtime + MIN_FILE_AGE)
+    if time.time() < eligible:
+        state.defer(path, eligible)
+        return
+    try:
+        LOG.info("Inspecting changed file: %s", path)
+        result = analyze(path)
+        dropped_data = sum(1 for stream in result.info.get("streams", []) if stream.get("codec_type") == "data")
+        final_hash = ""
+        if result.status == "Candidate" and AUTO_REPAIR:
+            final_hash, dropped_data = repair_one(path, result)
+            stat = path.stat()
+            remember_internal_change(path, stat)
+            result = Analysis(
+                "Repaired",
+                "Composition timestamps rebuilt without video re-encoding; original replaced after validation",
+                result.info, result.video, result.comparable, result.different,
             )
-            record_history(path, result.status, result.reason, sha256=final_hash, dropped_data=dropped_data)
-        except Exception as exc:  # continue with other files; original replacement has rollback
-            LOG.exception("Failed while processing %s", path)
-            try:
-                state.save(path, path.stat(), "Failed", str(exc), 1)
-                record_history(path, "Failed", str(exc))
-            except OSError:
-                pass
-        finally:
-            state.export_csv(CONFIG_ROOT / "latest.csv")
-            write_heartbeat(cycle_started, len(files), False, index, path)
-    state.export_csv(CONFIG_ROOT / "latest.csv")
-    write_heartbeat(cycle_started, len(files), not STOP_REQUESTED, len(files), None)
-    LOG.info("Scan cycle complete")
+        state.save(path, stat, result.status, result.reason, result.comparable, result.different, dropped_data, final_hash)
+        state.record(path, result.status, result.reason)
+        state.complete(path)
+        with runtime.lock:
+            runtime.processed_session += 1
+    except Exception as exc:
+        reason = compact_error(str(exc))
+        LOG.exception("Failed while processing %s", path)
+        try:
+            state.save(path, path.stat(), "Failed", reason)
+            state.record(path, "Failed", reason)
+            state.defer(path, time.time() + RETRY_FAILED_AFTER, increment=True)
+        except OSError:
+            pass
+    finally:
+        with runtime.lock:
+            runtime.current_path = ""
+            runtime.current_action = "idle"
+            runtime.pending_count = state.pending_count()
 
 
 def healthcheck() -> int:
     heartbeat = CONFIG_ROOT / "heartbeat.json"
     try:
         data = json.loads(heartbeat.read_text(encoding="utf-8"))
-        maximum_age = max(1800, SCAN_INTERVAL * 2 + 1800)
-        return 0 if time.time() - float(data["time"]) <= maximum_age else 1
+        return 0 if time.time() - float(data["time"]) <= 600 else 1
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         return 1
 
@@ -635,11 +1031,14 @@ def acquire_lock() -> int:
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
         import fcntl
-
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (ImportError, BlockingIOError) as exc:
-        os.close(descriptor)
-        raise RuntimeError("Another repair service instance is already running") from exc
+    except ImportError:  # Windows development and tests; production images are Linux
+        fcntl = None
+    if fcntl is not None:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise RuntimeError("Another repair service instance is already running") from exc
     os.ftruncate(descriptor, 0)
     os.write(descriptor, str(os.getpid()).encode("ascii"))
     return descriptor
@@ -647,7 +1046,7 @@ def acquire_lock() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="Run one scan cycle and exit")
+    parser.add_argument("--once", action="store_true", help="Reconcile and process currently eligible files, then exit")
     parser.add_argument("--healthcheck", action="store_true")
     args = parser.parse_args()
     if args.healthcheck:
@@ -660,50 +1059,85 @@ def main() -> int:
     for tool in (FFMPEG, FFPROBE, MP4BOX):
         if not shutil.which(tool):
             raise RuntimeError(f"Required tool not found: {tool}")
+    parse_reconcile_time(RECONCILE_LOCAL_TIME)
+    for name in LEGACY_ENV_NAMES:
+        if os.getenv(name) is not None:
+            LOG.warning("Legacy setting %s is ignored by version 2.0", name)
 
     lock_descriptor = acquire_lock()
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     state = State(CONFIG_ROOT / "state.sqlite3")
+    runtime = Runtime()
+    runtime.last_reconcile = float(state.meta_get("last_reconcile", "0") or 0)
+    runtime.next_reconcile = next_reconcile_time()
+    events: queue.Queue[WatchEvent] = queue.Queue()
+    observer = None
+    if Observer is None:
+        runtime.watcher_error = "python watchdog is unavailable"
+    else:
+        try:
+            observer = Observer()
+            observer.schedule(IncrementalEventHandler(events), str(MEDIA_ROOT), recursive=True)
+            observer.start()
+            runtime.watcher_active = True
+        except Exception as exc:
+            runtime.watcher_error = compact_error(str(exc))
+            LOG.exception("Filesystem watcher unavailable; daily reconciliation remains active")
+
+    heartbeat_thread = threading.Thread(target=heartbeat_loop, args=(runtime,), name="heartbeat", daemon=True)
+    heartbeat_thread.start()
     web_service: WebService | None = None
     if WEB_UI_ENABLED:
         try:
             web_service = start_web_server(
-                config_root=CONFIG_ROOT,
-                host=WEB_UI_HOST,
-                port=WEB_UI_PORT,
-                username=WEB_USERNAME,
-                password=WEB_PASSWORD,
+                config_root=CONFIG_ROOT, host=WEB_UI_HOST, port=WEB_UI_PORT,
                 show_full_paths=WEB_SHOW_FULL_PATHS,
                 settings={
                     "auto_repair": AUTO_REPAIR,
-                    "scan_interval_seconds": SCAN_INTERVAL,
+                    "file_settle_seconds": FILE_SETTLE_SECONDS,
                     "min_file_age_seconds": MIN_FILE_AGE,
+                    "reconcile_local_time": RECONCILE_LOCAL_TIME,
                     "name_filter_enabled": bool(NAME_CONTAINS),
                     "show_full_paths": WEB_SHOW_FULL_PATHS,
                 },
             )
         except Exception:
             LOG.exception("Web UI failed to start; repair service will continue without it")
-    LOG.info(
-        "Service started: media=%s name_contains=%r auto_repair=%s interval=%ss min_age=%ss",
-        MEDIA_ROOT,
-        NAME_CONTAINS,
-        AUTO_REPAIR,
-        SCAN_INTERVAL,
-        MIN_FILE_AGE,
-    )
+
+    LOG.info("Service 2.0 started: media=%s auto_repair=%s reconcile=%s", MEDIA_ROOT, AUTO_REPAIR, RECONCILE_LOCAL_TIME)
     try:
+        reconcile(state, runtime)
         while not STOP_REQUESTED:
-            scan_cycle(state)
-            if args.once or STOP_REQUESTED:
+            drain_events(state, events)
+            if time.time() >= runtime.next_reconcile:
+                reconcile(state, runtime)
+            due = state.due(1 if not args.once else 100)
+            if due:
+                for pending in due:
+                    if STOP_REQUESTED:
+                        break
+                    process_pending(state, runtime, pending)
+                if args.once:
+                    break
+                continue
+            if args.once:
                 break
-            deadline = time.time() + SCAN_INTERVAL
-            while time.time() < deadline and not STOP_REQUESTED:
-                time.sleep(min(5, max(0, deadline - time.time())))
+            with runtime.lock:
+                runtime.pending_count = state.pending_count()
+            next_due = state.next_due()
+            deadline = min(runtime.next_reconcile, next_due if next_due is not None else runtime.next_reconcile)
+            WAKE_EVENT.wait(max(0.1, min(60.0, deadline - time.time())))
+            WAKE_EVENT.clear()
     finally:
+        if observer is not None:
+            observer.stop()
+            observer.join(timeout=5)
         if web_service:
             web_service.stop()
+        runtime.stop_event.set()
+        heartbeat_thread.join(timeout=5)
+        state.close()
         os.close(lock_descriptor)
     LOG.info("Service stopped")
     return 0

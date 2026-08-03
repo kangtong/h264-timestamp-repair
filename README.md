@@ -1,171 +1,89 @@
 # H.264 Timestamp Repair
 
-一个通用的 Docker 服务，用于检测并修复 MP4 文件中缺失或错误的 H.264 合成时间戳。此类文件通常包含 B 帧，但数据包的 PTS 与 DTS 始终相同，可能在直接播放时表现为节奏不均匀、轻微停顿或类似掉帧的现象。
+一个面向 Docker/Linux/NAS 的通用服务，用于检测 MP4 中缺失的 H.264 合成时间戳，并在严格验证后进行无损封装修复。视频不会重新编码。
 
-项目不针对任何特定媒体内容、文件命名方式、播放器品牌或 NAS 系统。
+## 2.0 的工作方式
 
-## 核心特性
+- 使用 Linux 文件事件监听新增、写入、移动、重命名和删除，不再按固定间隔反复遍历整个媒体库。
+- 变化路径进入 SQLite 持久队列；最后一次变化静默 60 秒并满足最小文件年龄后处理。
+- 每天在本地时间 04:00 做一次仅含目录和元数据的校准，用来捕捉停机期间或文件系统漏报的变化。
+- 已确认文件仅在路径、设备、inode、大小、纳秒 mtime/ctime、分析版本和检测配置全部一致时命中缓存。
+- MP4Box 的临时文件固定写入 `/work/job-*`，不会受容器小容量 `/tmp` 限制。
+- Web 界面匿名且只读；默认隐藏完整媒体路径，不提供删除、配置修改或手动修复功能。
 
-- 递归扫描媒体目录中的 MP4 文件，默认不限制文件名。
-- 对视频开头、中间和结尾进行数据包时间戳采样，减少误判。
-- 仅处理单路主 H.264 视频、恒定帧率且包含 B 帧的安全候选文件。
-- 使用 MP4Box 重建合成时间戳，不重新编码视频码流。
-- 音频、兼容字幕、章节和元数据通过码流复制保留。
-- 修复后检查轨道、视频属性、帧数、时间戳和多段解码结果。
-- 在媒体目录中暂存并校验 SHA-256，然后原子替换原文件；失败时自动回滚。
-- 使用 SQLite 增量缓存，未变化的文件不会重复分析。
-- 提供带身份验证的只读 Web 控制台，可查看扫描进度、结果统计、文件状态和最近事件。
-- 支持 `linux/amd64` 和 `linux/arm64`。
+> Web 端口没有登录验证。请只在可信局域网中开放，绝对不要直接暴露到互联网。
 
-## 快速部署
-
-公开镜像：
-
-```text
-kangtong1993/h264-timestamp-repair:1.1.0
-```
-
-复制示例配置：
+## 快速开始
 
 ```bash
-cp .env.example .env
+mkdir -p h264-timestamp-repair/config h264-timestamp-repair/work
+cd h264-timestamp-repair
+curl -O https://raw.githubusercontent.com/kangtong/h264-timestamp-repair/main/docker-compose.hub.yml
 ```
 
-编辑 `.env`，至少设置 Docker 主机上的媒体目录绝对路径：
+创建 `.env`：
 
-```env
+```dotenv
 MEDIA_HOST_PATH=/srv/media
-```
-
-建议先保持扫描模式：
-
-```env
+DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:2.0.0
+TZ=Asia/Shanghai
 AUTO_REPAIR=false
+MIN_FILE_AGE_SECONDS=3600
+FILE_SETTLE_SECONDS=60
+RECONCILE_LOCAL_TIME=04:00
+WEB_UI_HOST_PORT=8080
 ```
 
-启动并查看报告，确认识别结果符合预期：
+先以只扫描模式启动：
 
 ```bash
 docker compose -f docker-compose.hub.yml up -d
-docker compose -f docker-compose.hub.yml logs -f --tail=100
+docker compose -f docker-compose.hub.yml logs -f
 ```
 
-报告保存在 `config/latest.csv`。确认候选文件后，将 `.env` 改为：
+确认检测结果后，将 `AUTO_REPAIR=true` 并重新创建容器。自动修复只处理确认候选；修复文件经过时间戳、流属性、抽样解码和哈希验证后才原子替换原文件。
 
-```env
-AUTO_REPAIR=true
-```
+Web 地址为 `http://NAS地址:8080/`。状态、文件列表和最近事件均直接从 SQLite 读取；2.0 不生成或导出 CSV。
 
-然后重新创建服务：
-
-```bash
-docker compose -f docker-compose.hub.yml up -d --force-recreate
-```
-
-任何支持 Docker Compose 的 Linux 服务器、家用服务器或 NAS 都可以采用相同方式部署。
-
-## Web 界面
-
-Compose 默认把只读 Web 界面发布到主机的 `8080` 端口：
-
-```text
-http://服务器IP:8080
-```
-
-默认用户名为 `admin`。如果 `.env` 中的 `WEB_PASSWORD` 留空，服务会在第一次启动时生成随机密码并写入：
-
-```text
-config/web-password.txt
-```
-
-也可以在启动前设置固定密码：
-
-```env
-WEB_USERNAME=admin
-WEB_PASSWORD=请填写强密码
-```
-
-Web 界面及其 JSON API 均使用 HTTP Basic Auth。界面只提供读取功能，不包含修改配置、删除文件或手动触发修复的操作。默认只显示文件名，API 和下载的 CSV 也不会包含完整媒体路径；如确有需要，可设置 `WEB_SHOW_FULL_PATHS=true`。
-
-端口默认监听所有主机网络接口，便于局域网访问。HTTP Basic Auth 本身不加密连接，因此不要把该端口直接暴露到互联网；也可以设置 `WEB_UI_BIND_ADDRESS=127.0.0.1`，再通过启用 HTTPS 的受保护反向代理访问。
-
-## 配置项
+## 配置
 
 | 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `MEDIA_HOST_PATH` | 无 | Docker 主机上的媒体目录绝对路径 |
-| `DOCKER_IMAGE` | `kangtong1993/h264-timestamp-repair:1.1.0` | 使用的容器镜像 |
-| `AUTO_REPAIR` | `false` | `false` 仅扫描，`true` 自动修复并覆盖原文件 |
-| `NAME_CONTAINS` | 空 | 可选文件名过滤；为空时扫描所有 MP4 |
-| `SCAN_INTERVAL_SECONDS` | `1800` | 两轮扫描之间的等待时间 |
-| `MIN_FILE_AGE_SECONDS` | `3600` | 新文件至少需要稳定存在的时间 |
-| `STABLE_SCANS` | `1` | 文件大小和修改时间需要保持不变的扫描次数 |
-| `SAMPLE_SECONDS` | `8` | 每个时间戳采样区间的秒数 |
-| `MINIMUM_PACKETS` | `60` | 判定所需的最少可比较数据包数 |
-| `RETRY_FAILED_AFTER_SECONDS` | `86400` | 失败文件的重试间隔 |
-| `KEEP_TEMP_ON_FAILURE` | `false` | 失败时是否保留工作文件用于诊断 |
-| `WEB_UI_ENABLED` | `true` | 是否启用只读 Web 界面 |
-| `WEB_UI_BIND_ADDRESS` | `0.0.0.0` | Web 端口在 Docker 主机上的绑定地址 |
-| `WEB_UI_HOST_PORT` | `8080` | Docker 主机上的 Web 端口 |
-| `WEB_USERNAME` | `admin` | Web 登录用户名 |
-| `WEB_PASSWORD` | 空 | Web 密码；为空时自动生成并持久化 |
-| `WEB_SHOW_FULL_PATHS` | `false` | 是否在 Web/API/CSV 中显示完整媒体路径 |
+|---|---:|---|
+| `MEDIA_HOST_PATH` | 必填 | Docker 主机上的媒体目录 |
+| `DOCKER_IMAGE` | `kangtong1993/h264-timestamp-repair:2.0.0` | 容器镜像 |
+| `TZ` | `Asia/Shanghai` | 容器本地时区 |
+| `NAME_CONTAINS` | 空 | 可选文件名过滤；空表示所有 MP4 |
+| `AUTO_REPAIR` | `false` | 是否自动修复确认候选 |
+| `MIN_FILE_AGE_SECONDS` | `3600` | 文件修改时间至少多旧才处理 |
+| `FILE_SETTLE_SECONDS` | `60` | 最后一次文件事件后的静默时间 |
+| `RECONCILE_LOCAL_TIME` | `04:00` | 每日元数据校准时间，格式 HH:MM |
+| `SAMPLE_SECONDS` | `8` | 开头、中间、结尾各抽样秒数 |
+| `MINIMUM_PACKETS` | `60` | 自动判定所需的最少可比较视频包 |
+| `RETRY_FAILED_AFTER_SECONDS` | `86400` | 失败后的重试间隔 |
+| `EVENT_HISTORY_LIMIT` | `5000` | SQLite 最近事件保留条数 |
+| `KEEP_TEMP_ON_FAILURE` | `false` | 是否在 `/work` 保留失败现场 |
+| `WEB_UI_ENABLED` | `true` | 是否启用匿名只读 Web 界面 |
+| `WEB_UI_BIND_ADDRESS` | `0.0.0.0` | Docker 主机端口绑定地址 |
+| `WEB_UI_HOST_PORT` | `8080` | Docker 主机 Web 端口 |
+| `WEB_SHOW_FULL_PATHS` | `false` | Web/API 是否显示完整媒体路径 |
 
-## 判定逻辑
+1.x 的 `SCAN_INTERVAL_SECONDS`、`STABLE_SCANS`、`WEB_USERNAME` 和 `WEB_PASSWORD` 在 2.0 中会被忽略并记录迁移提示。
 
-文件需要同时满足以下条件才会成为自动修复候选：
+## 持久数据与升级
 
-1. 容器中只有一路主视频轨道，且编码为 H.264。
-2. 视频轨道声明包含 B 帧。
-3. 开头、中间和结尾的采样中有足够多可比较数据包。
-4. 所有采样数据包均表现为 `PTS = DTS`，即缺少正常的合成时间偏移。
-5. 平均帧率与标称帧率一致，不属于可变或含糊帧率。
-6. 不包含无法安全复制回 MP4 的字幕轨道。
+- `config/state.sqlite3`：文件身份、分析结果、待处理队列和最近事件。
+- `config/heartbeat.json`：健康检查与当前任务状态。
+- `work/job-*`：修复过程中的临时文件；成功后自动清理。
 
-其他文件会标记为 `Healthy`、`Skipped` 或 `Uncertain`，不会自动修改。
+首次从 1.x 启动时，服务会创建新的 2.0 数据库，复用元数据仍一致的有效缓存，将失败或变化文件重新排队，并在完整性检查通过后清理旧的膨胀数据库、历史、CSV 和旧密码文件。
 
-## 修复与安全机制
+## 安全边界
 
-修复过程会先从源文件提取 H.264 码流，再用原始标称帧率重建 MP4 视频轨道，最后复制其他兼容轨道和元数据。视频不会重新编码，因此不会产生有损画质变化。
+- 仅自动修复单一主 H.264 视频流、固定/明确帧率及可安全复制字幕的 MP4。
+- 原文件在完整修复、属性比较、抽样解码、哈希和安装后验证全部成功前不会被替换。
+- 文件系统监听不可用时服务进入降级状态，但仍由每日元数据校准发现变化。
+- 硬链接和无法可靠识别的移动不会跨路径共享修复结果，优先保证安全。
 
-容器需要对媒体目录具有读写权限。替换前会验证输出文件，并在源文件所在目录执行暂存、备份和原子改名。任何安装后验证失败都会恢复原文件。即使如此，首次使用前仍建议准备独立备份，并先运行扫描模式。
+## 架构
 
-处理期间，工作目录通常需要至少约源文件大小 2.25 倍的可用空间；另预留 1 GiB 安全余量。
-
-## 状态与日志
-
-- `config/latest.csv`：当前文件状态汇总。
-- `config/history.jsonl`：每次新分析或修复事件。
-- `config/state.sqlite3`：增量扫描缓存。
-- `config/heartbeat.json`：健康检查和当前扫描状态。
-- `work/`：修复期间的临时文件。
-
-## 更新镜像
-
-固定版本标签适合稳定部署：
-
-```env
-DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:1.1.0
-```
-
-拉取更新并重新创建服务：
-
-```bash
-docker compose -f docker-compose.hub.yml pull
-docker compose -f docker-compose.hub.yml up -d --force-recreate
-```
-
-## 自行构建与发布
-
-本地构建：
-
-```bash
-docker compose up -d --build
-```
-
-公开仓库包含手动触发的 GitHub Actions 工作流，可发布 `amd64` 和 `arm64` 镜像。需要配置：
-
-- Repository variable：`DOCKERHUB_USERNAME`
-- Repository secret：`DOCKERHUB_TOKEN`
-
-也可以在装有 Docker Buildx 的环境中运行 `publish-to-dockerhub.sh`。
+镜像发布为 `linux/amd64` 和 `linux/arm64`。项目与任何特定媒体服务器、NAS 品牌或内容类型无关。
