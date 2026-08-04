@@ -21,6 +21,12 @@ MP4 和 MKV 使用同一个时间轴完整性核心：最终依据是解码后�
 - 手动任务、扫描队列和媒体库刷新队列均持久化到 SQLite。
 - 修复完成并通过时间轴、码流哈希、流属性和抽样解码校验后才原子替换原文件。
 
+### 3.0.1 自动判定改进
+
+- 明确达到异常阈值的文件继续自动修复，不因 Annex-B 参数单元的安全重排而误报。
+- 低于阈值的单个孤立时间戳抖动按抽样噪声处理，减少不必要的人工确认。
+- 真正的画面 NAL 变化、可变帧率、样本不足或跨区段结论冲突仍会停止覆盖并等待确认。
+
 > Web 界面没有登录验证。请只在可信局域网开放，不要直接暴露到互联网。
 
 ## 快速开始
@@ -35,7 +41,7 @@ curl -O https://raw.githubusercontent.com/kangtong/h264-timestamp-repair/main/do
 
 ```dotenv
 MEDIA_HOST_PATH=/srv/media
-DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:3.0.0
+DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:3.0.1
 TZ=Asia/Shanghai
 AUTO_REPAIR=false
 REPAIR_MKV_TIMESTAMPS=true
@@ -107,7 +113,7 @@ docker compose -f docker-compose.watchcow.yml up -d
 
 - 时间轴自动修复仅适用于单主视频流、H.264、包含 B 帧且帧率固定或明确的文件。
 - 样本不足、可变帧率、结论冲突或无法安全复制的流不会自动修复。
-- 修复前后 H.264 裸码流必须完全一致；任何验证失败都会保留原文件。
+- 修复前后承载画面的 H.264 VCL NAL 必须逐个完全一致；SPS、PPS、SEI 等参数单元也按类型校验，允许封装器安全调整不同类型之间的排列位置。
 - 手动修复按钮不能绕过检测、兼容性和完整性验证。
 - 项目及测试数据使用通用名称，不包含用户媒体路径、内容名称、密钥或设备信息。
 

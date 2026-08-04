@@ -221,6 +221,43 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(0, anomalies)
         self.assertEqual("healthy", verdict)
 
+    def test_isolated_sub_threshold_pts_noise_does_not_require_manual_review(self) -> None:
+        noisy_values = [index / 30 for index in range(30)]
+        noisy_values[12] = noisy_values[11]
+        noisy = {"frames": [{"pts_time": f"{value:.6f}"} for value in noisy_values]}
+        good = {"frames": [{"pts_time": f"{index / 30:.6f}"} for index in range(30)]}
+        with mock.patch.object(
+            service, "run_capture", side_effect=[json.dumps(noisy), json.dumps(good), json.dumps(good)],
+        ):
+            _, anomalies, verdict, diagnostics = service.decoded_timeline_sample(
+                Path("minor-noise.mkv"), 100.0, 30.0,
+            )
+        self.assertEqual(1, anomalies)
+        self.assertEqual("healthy", verdict)
+        self.assertTrue(diagnostics["low_level_noise_ignored"])
+
+    def test_annexb_fingerprint_accepts_safe_parameter_unit_reordering(self) -> None:
+        start = b"\x00\x00\x00\x01"
+        sps, pps, sei = b"\x67sps", b"\x68pps", b"\x06sei"
+        idr, slice_unit = b"\x65idr-picture", b"\x41predicted-picture"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            before = root / "before.h264"
+            reordered = root / "reordered.h264"
+            changed = root / "changed.h264"
+            before.write_bytes(start.join((b"", sps, pps, sei, idr, slice_unit)))
+            reordered.write_bytes(start.join((b"", sei, sps, pps, idr, slice_unit)))
+            changed.write_bytes(start.join((b"", sei, sps, pps, b"\x65changed-picture", slice_unit)))
+
+            before_fingerprint = service.annexb_nal_fingerprints(before)
+            reordered_fingerprint = service.annexb_nal_fingerprints(reordered)
+            changed_fingerprint = service.annexb_nal_fingerprints(changed)
+            raw_hashes_differ = service.sha256(before) != service.sha256(reordered)
+
+        self.assertTrue(raw_hashes_differ)
+        self.assertEqual(before_fingerprint, reordered_fingerprint)
+        self.assertNotEqual(before_fingerprint["vcl"], changed_fingerprint["vcl"])
+
     def test_mp4_and_mkv_use_the_same_timeline_issue_code(self) -> None:
         info = self.media_info_with_chapter(title="valid", start=5.0, end=80.0)
         for name in ("sample.mp4", "sample.mkv"):
