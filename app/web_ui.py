@@ -21,6 +21,7 @@ LOG = logging.getLogger("timestamp-repair.web")
 STATUS_LABELS = {
     "Healthy": "正常", "Candidate": "待修复", "Repaired": "已修复",
     "Skipped": "已跳过", "Uncertain": "需要人工确认", "Failed": "处理失败",
+    "QueuedRepair": "等待自动修复", "QueuedRecheck": "等待自动复检",
     "WaitingStable": "等待文件写入完成", "MediaRefreshQueued": "等待媒体库刷新",
     "MediaRefreshWaiting": "等待媒体入库", "MediaRefreshDeferred": "媒体库刷新重试",
     "MediaRefreshed": "媒体库已刷新", "Migration": "数据升级",
@@ -81,7 +82,7 @@ def start_web_server(
     heartbeat_path = config_root / "heartbeat.json"
 
     class DashboardHandler(BaseHTTPRequestHandler):
-        server_version = "VideoIntegrityRepair/3.0.1"
+        server_version = "VideoIntegrityRepair/3.0.2"
 
         def log_message(self, format_text: str, *args: Any) -> None:
             LOG.debug("%s - %s", self.address_string(), format_text % args)
@@ -141,16 +142,24 @@ def start_web_server(
             if connection is None:
                 return {"total": 0}
             try:
-                rows = connection.execute("SELECT status,COUNT(*) AS count FROM files GROUP BY status").fetchall()
-                result = {str(row["status"]): int(row["count"]) for row in rows}
+                rows = connection.execute(
+                    "SELECT CASE "
+                    "WHEN p.path IS NOT NULL AND p.requested_action='repair' THEN 'QueuedRepair' "
+                    "WHEN p.path IS NOT NULL THEN 'QueuedRecheck' ELSE f.status END AS effective_status, "
+                    "COUNT(*) AS count FROM files f LEFT JOIN pending p ON p.path=f.path "
+                    "GROUP BY effective_status"
+                ).fetchall()
+                result = {str(row["effective_status"]): int(row["count"]) for row in rows}
                 result["total"] = sum(result.values())
                 result["pending"] = int(connection.execute("SELECT COUNT(*) FROM pending").fetchone()[0])
                 result["media_refresh_pending"] = int(
                     connection.execute("SELECT COUNT(*) FROM media_refresh_queue").fetchone()[0]
                 )
                 issue_rows = connection.execute(
-                    "SELECT issue_category,COUNT(*) AS count FROM files "
-                    "WHERE status IN ('Candidate','Uncertain','Failed') GROUP BY issue_category"
+                    "SELECT f.issue_category,COUNT(*) AS count FROM files f "
+                    "LEFT JOIN pending p ON p.path=f.path "
+                    "WHERE f.status IN ('Candidate','Uncertain','Failed') AND p.path IS NULL "
+                    "GROUP BY f.issue_category"
                 ).fetchall()
                 result["issues"] = {str(row["issue_category"]): int(row["count"]) for row in issue_rows}
                 return result
@@ -199,18 +208,21 @@ def start_web_server(
             clauses: list[str] = []
             params: list[Any] = []
             if status:
-                clauses.append("status = ?")
+                clauses.append(
+                    "CASE WHEN p.path IS NOT NULL AND p.requested_action='repair' THEN 'QueuedRepair' "
+                    "WHEN p.path IS NOT NULL THEN 'QueuedRecheck' ELSE f.status END = ?"
+                )
                 params.append(status)
             if issue:
-                clauses.append("issue_category = ?")
+                clauses.append("f.issue_category = ?")
                 params.append(issue)
             if container:
-                clauses.append("container = ?")
+                clauses.append("f.container = ?")
                 params.append(container)
             if problems_only:
-                clauses.append("status IN ('Candidate','Uncertain','Failed')")
+                clauses.append("f.status IN ('Candidate','Uncertain','Failed') AND p.path IS NULL")
             if search:
-                clauses.append("(path LIKE ? ESCAPE '\\' OR reason LIKE ? ESCAPE '\\')")
+                clauses.append("(f.path LIKE ? ESCAPE '\\' OR f.reason LIKE ? ESCAPE '\\')")
                 escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 params.extend([f"%{escaped}%", f"%{escaped}%"])
             where = " WHERE " + " AND ".join(clauses) if clauses else ""
@@ -219,19 +231,27 @@ def start_web_server(
             if connection is None:
                 return {"total": 0, "offset": offset, "limit": limit, "items": []}
             try:
-                total = int(connection.execute("SELECT COUNT(*) FROM files" + where, params).fetchone()[0])
+                from_clause = " FROM files f LEFT JOIN pending p ON p.path=f.path"
+                total = int(connection.execute("SELECT COUNT(*)" + from_clause + where, params).fetchone()[0])
                 rows = connection.execute(
-                    "SELECT file_id,path,status,reason,checked_at,comparable,different,dropped_data,"
-                    "container,issue_category,reason_code,diagnostics_json "
-                    "FROM files" + where + " ORDER BY checked_at DESC,path LIMIT ? OFFSET ?",
+                    "SELECT f.file_id,f.path,f.status,f.reason,f.checked_at,f.comparable,f.different,"
+                    "f.dropped_data,f.container,f.issue_category,f.reason_code,f.diagnostics_json,"
+                    "p.requested_action " + from_clause + where +
+                    " ORDER BY f.checked_at DESC,f.path LIMIT ? OFFSET ?",
                     [*params, limit, offset],
                 ).fetchall()
                 items = []
                 for row in rows:
                     item = dict(row)
                     item["path"] = _display_path(str(item["path"]), show_full_paths)
-                    item["status_code"] = item["status"]
-                    item["status_label"] = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
+                    requested_action = item.pop("requested_action")
+                    effective_status = (
+                        "QueuedRepair" if requested_action == "repair"
+                        else "QueuedRecheck" if requested_action is not None
+                        else str(item["status"])
+                    )
+                    item["status_code"] = effective_status
+                    item["status_label"] = STATUS_LABELS.get(effective_status, effective_status)
                     item["issue_label"] = ISSUE_LABELS.get(str(item["issue_category"]), "其他")
                     item["reason_label"] = REASON_LABELS.get(str(item["reason_code"]), str(item["reason"]))
                     try:
@@ -253,17 +273,22 @@ def start_web_server(
                 return {"items": []}
             try:
                 rows = connection.execute(
-                    "SELECT event_time,path,status,reason FROM events ORDER BY id DESC LIMIT ?",
+                    "SELECT e.event_time,e.path,e.status,e.reason,p.requested_action "
+                    "FROM events e LEFT JOIN pending p ON p.path=e.path ORDER BY e.id DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
                 return {
                     "items": [
-                        {
+                        (lambda effective_status: {
                             "time": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(row["event_time"])),
                             "path": _display_path(str(row["path"]), show_full_paths) if row["path"] else "",
-                            "status": row["status"], "reason": row["reason"],
-                            "status_label": STATUS_LABELS.get(str(row["status"]), str(row["status"])),
-                        }
+                            "status": effective_status, "reason": row["reason"],
+                            "status_label": STATUS_LABELS.get(effective_status, effective_status),
+                        })(
+                            "QueuedRepair" if row["requested_action"] == "repair"
+                            else "QueuedRecheck" if row["requested_action"] is not None
+                            else str(row["status"])
+                        )
                         for row in rows
                     ]
                 }
@@ -293,13 +318,21 @@ def start_web_server(
                 return None
             try:
                 row = connection.execute(
-                    "SELECT * FROM files WHERE file_id=?", (file_id,),
+                    "SELECT f.*,p.requested_action FROM files f LEFT JOIN pending p ON p.path=f.path "
+                    "WHERE f.file_id=?", (file_id,),
                 ).fetchone()
                 if row is None:
                     return None
                 item = dict(row)
                 item["path"] = _display_path(str(item["path"]), show_full_paths)
-                item["status_label"] = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
+                requested_action = item.pop("requested_action")
+                effective_status = (
+                    "QueuedRepair" if requested_action == "repair"
+                    else "QueuedRecheck" if requested_action is not None
+                    else str(item["status"])
+                )
+                item["status_code"] = effective_status
+                item["status_label"] = STATUS_LABELS.get(effective_status, effective_status)
                 item["issue_label"] = ISSUE_LABELS.get(str(item["issue_category"]), "其他")
                 item["reason_label"] = REASON_LABELS.get(str(item["reason_code"]), str(item["reason"]))
                 try:

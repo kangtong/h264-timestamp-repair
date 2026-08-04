@@ -12,7 +12,7 @@ const viewTitles = {overview: "概览", problems: "问题文件", files: "全部
 const statusClass = (status) => {
   const value = String(status || "").toLowerCase();
   if (["healthy", "repaired", "mediarefreshed", "succeeded"].includes(value)) return "good";
-  if (["candidate", "uncertain", "waitingstable", "queued", "running"].includes(value)) return "warn";
+  if (["candidate", "uncertain", "queuedrepair", "queuedrecheck", "waitingstable", "queued", "running"].includes(value)) return "warn";
   if (["failed", "mediarefreshdeferred"].includes(value)) return "bad";
   return "neutral";
 };
