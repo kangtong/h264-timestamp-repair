@@ -1,9 +1,10 @@
 services:
-  h264-timestamp-repair:
+  video-integrity-repair:
     image: ${DOCKER_IMAGE:-kangtong1993/h264-timestamp-repair:3.0.0}
     pull_policy: always
-    container_name: h264-timestamp-repair
+    container_name: video-integrity-repair
     restart: unless-stopped
+    network_mode: bridge
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       MEDIA_ROOT: /media
@@ -32,11 +33,27 @@ services:
       WEB_UI_PORT: 8080
       WEB_SHOW_FULL_PATHS: ${WEB_SHOW_FULL_PATHS:-false}
     ports:
-      - "${WEB_UI_BIND_ADDRESS:-0.0.0.0}:${WEB_UI_HOST_PORT:-8080}:8080"
+      - "${WEB_UI_BIND_ADDRESS:-0.0.0.0}:${WEB_UI_HOST_PORT:-18080}:8080"
     volumes:
       - ${MEDIA_HOST_PATH:?Set MEDIA_HOST_PATH in .env}:/media:rw
       - ./config:/config:rw
       - ./work:/work:rw
+    labels:
+      watchcow.enable: "true"
+      watchcow.appname: "watchcow.video-integrity-repair"
+      watchcow.display_name: "视频完整性修复"
+      watchcow.desc: "检测并无损修复视频时间轴和章节元数据异常"
+      watchcow.version: "3.0.0"
+      watchcow.maintainer: "Video Integrity Repair"
+      watchcow.service_port: "${WEB_UI_HOST_PORT:-18080}"
+      watchcow.protocol: "http"
+      watchcow.path: "/"
+      watchcow.ui_type: "url"
+      watchcow.all_users: "true"
+      watchcow.title: "视频完整性修复"
+      watchcow.control.access_perm: "readonly"
+      watchcow.control.port_perm: "readonly"
+      watchcow.control.path_perm: "readonly"
     read_only: true
     tmpfs:
       - /tmp:size=256m

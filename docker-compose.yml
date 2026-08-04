@@ -2,7 +2,7 @@ services:
   h264-timestamp-repair:
     build:
       context: .
-    image: local/h264-timestamp-repair:2.2.1
+    image: local/h264-timestamp-repair:3.0.0
     container_name: h264-timestamp-repair
     restart: unless-stopped
     environment:
@@ -12,6 +12,7 @@ services:
       WORK_ROOT: /work
       NAME_CONTAINS: "${NAME_CONTAINS:-}"
       AUTO_REPAIR: ${AUTO_REPAIR:-false}
+      REPAIR_MKV_TIMESTAMPS: ${REPAIR_MKV_TIMESTAMPS:-true}
       REPAIR_EMPTY_FULL_CHAPTERS: ${REPAIR_EMPTY_FULL_CHAPTERS:-true}
       EMBY_URL: "${EMBY_URL:-}"
       EMBY_MEDIA_ROOT: "${EMBY_MEDIA_ROOT:-}"
