@@ -38,6 +38,7 @@ REASON_LABELS = {
     "timestamps_present": "显示时间戳正常", "no_b_frames": "视频不包含需要重排的 B 帧",
     "unsupported_codec": "主视频编码不在自动修复范围内", "no_video": "没有找到主视频流",
     "too_few_samples": "有效时间戳样本不足", "ambiguous_timeline": "抽样结果不一致，无法安全自动判断",
+    "validation_failed": "修复结果未通过完整性验证，原文件未被覆盖",
     "variable_fps": "可变或不明确的帧率不能自动修复", "unsupported_streams": "存在无法安全复制的媒体流",
     "repaired_timeline": "已无损重建视频显示时间戳", "repaired_chapter": "已移除无效的整段空章节",
     "repaired_multiple": "已修复时间轴和章节元数据异常", "processing_failed": "处理过程中发生错误",
@@ -80,7 +81,7 @@ def start_web_server(
     heartbeat_path = config_root / "heartbeat.json"
 
     class DashboardHandler(BaseHTTPRequestHandler):
-        server_version = "VideoIntegrityRepair/3.0"
+        server_version = "VideoIntegrityRepair/3.0.1"
 
         def log_message(self, format_text: str, *args: Any) -> None:
             LOG.debug("%s - %s", self.address_string(), format_text % args)

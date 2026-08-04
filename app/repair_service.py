@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import logging
+import mmap
 import os
 import queue
 import re
@@ -71,7 +72,7 @@ EMBY_REFRESH_MAX_RETRY_SECONDS = max(
     int(os.getenv("EMBY_REFRESH_MAX_RETRY_SECONDS", "21600")),
 )
 MP4_ANALYSIS_SIGNATURE = f"mp4:4:{SAMPLE_SECONDS}:{MINIMUM_PACKETS}:{int(REPAIR_EMPTY_FULL_CHAPTERS)}"
-MKV_ANALYSIS_SIGNATURE = f"mkv:1:{SAMPLE_SECONDS}:{MINIMUM_PACKETS}"
+MKV_ANALYSIS_SIGNATURE = f"mkv:2:{SAMPLE_SECONDS}:{MINIMUM_PACKETS}"
 ANALYSIS_SIGNATURE = MP4_ANALYSIS_SIGNATURE
 LEGACY_ENV_NAMES = ("SCAN_INTERVAL_SECONDS", "STABLE_SCANS", "WEB_USERNAME", "WEB_PASSWORD")
 MAX_ERROR_LENGTH = 4096
@@ -142,6 +143,7 @@ REASON_LABELS = {
     "no_video": "没有找到主视频流",
     "too_few_samples": "有效时间戳样本不足",
     "ambiguous_timeline": "抽样结果不一致，无法安全自动判断",
+    "validation_failed": "修复结果未通过完整性验证，原文件未被覆盖",
     "variable_fps": "可变或不明确的帧率不能自动修复",
     "unsupported_streams": "存在无法安全复制到目标封装的流",
     "repaired_timeline": "已无损重建视频显示时间戳",
@@ -444,10 +446,13 @@ def decoded_timeline_sample(
     }
     if total_transitions < MINIMUM_PACKETS or usable_segments == 0:
         return total_transitions, non_increasing, "uncertain", diagnostics
+    noise_limit = max(1, int(total_transitions * 0.005))
+    diagnostics["noise_limit"] = noise_limit
     required_segments = 1 if duration <= SAMPLE_SECONDS * 3 else 2
     if bad_segments >= required_segments:
         return total_transitions, non_increasing, "issue", diagnostics
-    if bad_segments == 0 and non_increasing == 0:
+    if bad_segments == 0 and non_increasing <= noise_limit:
+        diagnostics["low_level_noise_ignored"] = non_increasing > 0
         return total_transitions, non_increasing, "healthy", diagnostics
     return total_transitions, non_increasing, "uncertain", diagnostics
 
@@ -564,6 +569,76 @@ def sha256(
                     overall_progress=overall_start + (overall_end - overall_start) * ratio,
                 )
     return digest.hexdigest().upper()
+
+
+def annexb_nal_fingerprints(
+    path: Path,
+    *,
+    stage: str = "",
+    overall_start: float | None = None,
+    overall_end: float | None = None,
+) -> dict[str, Any]:
+    """Fingerprint H.264 NAL payloads while ignoring safe cross-type reordering."""
+    type_digests: dict[int, Any] = {}
+    type_counts: dict[int, int] = {}
+    vcl_digest = hashlib.sha256()
+    vcl_count = 0
+
+    with path.open("rb") as source:
+        with mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            total = len(data)
+
+            def find_start(position: int) -> tuple[int, int]:
+                marker = data.find(b"\x00\x00\x01", position)
+                if marker < 0:
+                    return -1, -1
+                start = marker
+                while start > 0 and data[start - 1] == 0:
+                    start -= 1
+                return start, marker + 3
+
+            start, payload_start = find_start(0)
+            if start < 0:
+                raise RepairValidationError("H.264 Annex-B 码流中没有找到 NAL 单元")
+            last_report = 0
+            while start >= 0:
+                next_start, next_payload = find_start(payload_start)
+                payload_end = next_start if next_start >= 0 else total
+                while payload_end > payload_start and data[payload_end - 1] == 0:
+                    payload_end -= 1
+                if payload_end > payload_start:
+                    payload = data[payload_start:payload_end]
+                    nal_type = payload[0] & 0x1F
+                    digest = type_digests.setdefault(nal_type, hashlib.sha256())
+                    type_counts[nal_type] = type_counts.get(nal_type, 0) + 1
+                    length = len(payload).to_bytes(8, "big")
+                    digest.update(length)
+                    digest.update(payload)
+                    if nal_type in {1, 2, 3, 4, 5}:
+                        vcl_digest.update(length)
+                        vcl_digest.update(payload)
+                        vcl_count += 1
+                if stage and overall_start is not None and overall_end is not None:
+                    if payload_end - last_report >= 64 * 1024 * 1024 or next_start < 0:
+                        ratio = min(1.0, payload_end / max(1, total))
+                        report_task(
+                            stage, stage_progress=ratio * 100,
+                            overall_progress=overall_start + (overall_end - overall_start) * ratio,
+                        )
+                        last_report = payload_end
+                if next_start < 0:
+                    break
+                start, payload_start = next_start, next_payload
+
+    if vcl_count == 0:
+        raise RepairValidationError("H.264 Annex-B 码流中没有找到画面 NAL 单元")
+    return {
+        "vcl": (vcl_count, vcl_digest.hexdigest()),
+        "types": {
+            str(nal_type): (type_counts[nal_type], type_digests[nal_type].hexdigest())
+            for nal_type in sorted(type_digests)
+        },
+    }
 
 
 def copyfile_progress(
@@ -883,9 +958,17 @@ def repair_one(path: Path, original: Analysis) -> tuple[str, int]:
                 62.0,
                 72.0,
             )
-            report_task("正在比较视频码流哈希", stage_progress=None, overall_progress=74.0)
-            if sha256(raw) != sha256(verified_raw):
-                raise RepairValidationError("Video bitstream SHA-256 changed during timestamp rebuild")
+            report_task("正在比较画面码流指纹", stage_progress=None, overall_progress=72.0)
+            before_nals = annexb_nal_fingerprints(
+                raw, stage="正在校验原始画面码流", overall_start=72.0, overall_end=75.0,
+            )
+            after_nals = annexb_nal_fingerprints(
+                verified_raw, stage="正在校验修复后画面码流", overall_start=75.0, overall_end=78.0,
+            )
+            if before_nals["vcl"] != after_nals["vcl"]:
+                raise RepairValidationError("修复前后的 H.264 画面 NAL 内容不一致")
+            if before_nals["types"] != after_nals["types"]:
+                raise RepairValidationError("修复前后的 H.264 参数 NAL 内容不一致")
         report_task("正在验证时间轴和媒体流", stage_progress=None, overall_progress=78.0)
         fixed = analyze(repaired)
         if packet_payload_fingerprints(repaired, fixed.info) != original_payloads:
@@ -1719,7 +1802,7 @@ def process_pending(
                         "Uncertain", compact_error(str(exc)), result.info, result.video,
                         result.comparable, result.different,
                         container=result.container, issue_category="unsupported",
-                        reason_code="ambiguous_timeline", diagnostics=result.diagnostics,
+                        reason_code="validation_failed", diagnostics=result.diagnostics,
                     )
                 else:
                     stat = path.stat()
@@ -1914,7 +1997,7 @@ def main() -> int:
             LOG.exception("Web UI failed to start; repair service will continue without it")
 
     LOG.info(
-        "Service 3.0 started: media=%s auto_repair=%s mkv_timestamps=%s empty_full_chapters=%s media_refresh=%s reconcile=%s",
+        "Service 3.0.1 started: media=%s auto_repair=%s mkv_timestamps=%s empty_full_chapters=%s media_refresh=%s reconcile=%s",
         MEDIA_ROOT, AUTO_REPAIR, REPAIR_MKV_TIMESTAMPS, REPAIR_EMPTY_FULL_CHAPTERS,
         media_refresh_client is not None, RECONCILE_LOCAL_TIME,
     )
