@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Continuously detect and repair broken H.264 B-frame timestamps in MP4 files."""
+"""Continuously detect and losslessly repair broken video timelines."""
 
 from __future__ import annotations
 
@@ -49,6 +49,7 @@ WORK_ROOT = Path(os.getenv("WORK_ROOT", "/work"))
 NAME_CONTAINS = os.getenv("NAME_CONTAINS", "")
 AUTO_REPAIR = env_bool("AUTO_REPAIR", False)
 REPAIR_EMPTY_FULL_CHAPTERS = env_bool("REPAIR_EMPTY_FULL_CHAPTERS", True)
+REPAIR_MKV_TIMESTAMPS = env_bool("REPAIR_MKV_TIMESTAMPS", True)
 MIN_FILE_AGE = max(0, int(os.getenv("MIN_FILE_AGE_SECONDS", "3600")))
 FILE_SETTLE_SECONDS = max(1, int(os.getenv("FILE_SETTLE_SECONDS", "60")))
 RECONCILE_LOCAL_TIME = os.getenv("RECONCILE_LOCAL_TIME", "04:00").strip()
@@ -69,12 +70,15 @@ EMBY_REFRESH_MAX_RETRY_SECONDS = max(
     EMBY_REFRESH_RETRY_SECONDS,
     int(os.getenv("EMBY_REFRESH_MAX_RETRY_SECONDS", "21600")),
 )
-ANALYSIS_SIGNATURE = f"3:{SAMPLE_SECONDS}:{MINIMUM_PACKETS}:{int(REPAIR_EMPTY_FULL_CHAPTERS)}"
+MP4_ANALYSIS_SIGNATURE = f"mp4:4:{SAMPLE_SECONDS}:{MINIMUM_PACKETS}:{int(REPAIR_EMPTY_FULL_CHAPTERS)}"
+MKV_ANALYSIS_SIGNATURE = f"mkv:1:{SAMPLE_SECONDS}:{MINIMUM_PACKETS}"
+ANALYSIS_SIGNATURE = MP4_ANALYSIS_SIGNATURE
 LEGACY_ENV_NAMES = ("SCAN_INTERVAL_SECONDS", "STABLE_SCANS", "WEB_USERNAME", "WEB_PASSWORD")
 MAX_ERROR_LENGTH = 4096
 
 STOP_REQUESTED = False
 CURRENT_CHILD: subprocess.Popen[str] | None = None
+ACTIVE_RUNTIME: Any = None
 WAKE_EVENT = threading.Event()
 INTERNAL_IDENTITIES: dict[str, tuple[tuple[int, ...], float]] = {}
 INTERNAL_IDENTITIES_LOCK = threading.Lock()
@@ -97,6 +101,72 @@ class Analysis:
     different: int = 0
     timestamp_issue: bool = False
     chapter_issue: bool = False
+    container: str = "mp4"
+    issue_category: str = "none"
+    reason_code: str = "unknown"
+    diagnostics: dict[str, Any] | None = None
+
+
+STATUS_LABELS = {
+    "Healthy": "正常",
+    "Candidate": "待修复",
+    "Repaired": "已修复",
+    "Skipped": "已跳过",
+    "Uncertain": "需要人工确认",
+    "WaitingStable": "等待文件写入完成",
+    "Failed": "处理失败",
+    "MediaRefreshQueued": "等待媒体库刷新",
+    "MediaRefreshWaiting": "等待媒体入库",
+    "MediaRefreshDeferred": "媒体库刷新重试",
+    "MediaRefreshed": "媒体库已刷新",
+}
+
+ISSUE_LABELS = {
+    "none": "无问题",
+    "timeline": "时间轴异常",
+    "chapter": "章节元数据异常",
+    "multiple": "多项异常",
+    "unsupported": "无法自动处理",
+    "failed": "处理失败",
+}
+
+REASON_LABELS = {
+    "timeline_bframe_pts": "H.264 B 帧显示时间轴顺序异常",
+    "timeline_missing_mp4": "H.264 B 帧显示时间轴顺序异常",
+    "timeline_order_mkv": "H.264 B 帧显示时间轴顺序异常",
+    "chapter_full_duration": "存在覆盖整段视频的无效空章节",
+    "timeline_and_chapter": "同时存在时间轴和章节元数据异常",
+    "timestamps_present": "显示时间戳正常",
+    "no_b_frames": "视频不包含需要重排的 B 帧",
+    "unsupported_codec": "主视频编码不在自动修复范围内",
+    "no_video": "没有找到主视频流",
+    "too_few_samples": "有效时间戳样本不足",
+    "ambiguous_timeline": "抽样结果不一致，无法安全自动判断",
+    "variable_fps": "可变或不明确的帧率不能自动修复",
+    "unsupported_streams": "存在无法安全复制到目标封装的流",
+    "repaired_timeline": "已无损重建视频显示时间戳",
+    "repaired_chapter": "已移除无效的整段空章节",
+    "repaired_multiple": "已修复时间轴和章节元数据异常",
+    "processing_failed": "处理过程中发生错误",
+}
+
+
+def container_kind(path: Path, info: dict[str, Any] | None = None) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".mkv":
+        return "mkv"
+    if suffix == ".mp4":
+        return "mp4"
+    names = str((info or {}).get("format", {}).get("format_name", ""))
+    return "mkv" if "matroska" in names else "mp4"
+
+
+def analysis_signature_for(path: Path) -> str:
+    return MKV_ANALYSIS_SIGNATURE if path.suffix.lower() == ".mkv" else MP4_ANALYSIS_SIGNATURE
+
+
+def file_identifier(path: Path) -> str:
+    return hashlib.sha256(str(path).encode("utf-8", errors="surrogatepass")).hexdigest()[:24]
 
 
 class RepairValidationError(RuntimeError):
@@ -137,12 +207,90 @@ def run_logged(args: list[str], log_base: Path, label: str) -> None:
         raise RuntimeError(f"{label} failed (exit {code}): {details}"[:MAX_ERROR_LENGTH])
 
 
+def report_task(
+    stage: str,
+    *,
+    stage_progress: float | None = None,
+    overall_progress: float | None = None,
+    speed: str = "",
+    eta_seconds: float | None = None,
+) -> None:
+    runtime = ACTIVE_RUNTIME
+    if runtime is None:
+        return
+    with runtime.lock:
+        runtime.current_stage = stage
+        runtime.stage_progress = stage_progress
+        runtime.overall_progress = overall_progress
+        runtime.current_speed = speed
+        runtime.eta_seconds = eta_seconds
+
+
+def run_ffmpeg_progress(
+    args: list[str],
+    log_base: Path,
+    label: str,
+    duration: float,
+    stage: str,
+    overall_start: float,
+    overall_end: float,
+) -> None:
+    """Run ffmpeg and publish media-time based progress."""
+    global CURRENT_CHILD
+    command = list(args)
+    command[1:1] = ["-progress", "pipe:1", "-nostats"]
+    stdout_path = log_base.with_suffix(".stdout.log")
+    stderr_path = log_base.with_suffix(".stderr.log")
+    report_task(stage, stage_progress=0.0, overall_progress=overall_start)
+    last_progress = 0.0
+    speed = ""
+    with stdout_path.open("w", encoding="utf-8") as stdout_log, stderr_path.open("w", encoding="utf-8") as stderr:
+        CURRENT_CHILD = subprocess.Popen(
+            command, text=True, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=stderr,
+        )
+        assert CURRENT_CHILD.stdout is not None
+        for raw_line in CURRENT_CHILD.stdout:
+            stdout_log.write(raw_line)
+            key, _, value = raw_line.strip().partition("=")
+            if key == "speed":
+                speed = value
+            elif key in {"out_time_us", "out_time_ms"}:
+                try:
+                    seconds = float(value) / 1_000_000.0
+                except ValueError:
+                    continue
+                if duration > 0:
+                    last_progress = min(1.0, max(last_progress, seconds / duration))
+                    overall = overall_start + (overall_end - overall_start) * last_progress
+                    try:
+                        numeric_speed = float(speed.rstrip("x")) if speed.endswith("x") else 0.0
+                    except ValueError:
+                        numeric_speed = 0.0
+                    eta = ((duration - seconds) / numeric_speed) if numeric_speed > 0 else None
+                    report_task(
+                        stage, stage_progress=last_progress * 100, overall_progress=overall,
+                        speed=speed, eta_seconds=eta,
+                    )
+        code = CURRENT_CHILD.wait()
+        CURRENT_CHILD = None
+    if code != 0:
+        with stderr_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            length = handle.tell()
+            handle.seek(max(0, length - 16 * 1024))
+            details = handle.read().decode("utf-8", errors="replace")
+        details = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", details).strip()
+        raise RuntimeError(f"{label} failed (exit {code}): {details}"[:MAX_ERROR_LENGTH])
+    report_task(stage, stage_progress=100.0, overall_progress=overall_end, speed=speed, eta_seconds=0.0)
+
+
 def media_info(path: Path) -> dict[str, Any]:
     return json.loads(
         run_capture(
             [
                 FFPROBE, "-v", "error", "-show_streams", "-show_chapters",
-                "-show_format", "-of", "json", str(path),
+                "-show_format", "-show_data_hash", "sha256", "-of", "json", str(path),
             ],
             "ffprobe stream inspection",
         )
@@ -226,68 +374,260 @@ def timestamp_sample(path: Path, duration: float) -> tuple[int, int]:
     return comparable, different
 
 
+def decoded_timeline_sample(
+    path: Path,
+    duration: float,
+    frame_rate: float,
+) -> tuple[int, int, str, dict[str, Any]]:
+    """Validate display-order PTS after decoding, independent of the container."""
+    positions: list[float] = []
+    for candidate in (0.0, max(0.0, duration / 2.0), max(0.0, duration - SAMPLE_SECONDS - 2.0)):
+        rounded = round(candidate, 3)
+        if rounded not in positions:
+            positions.append(rounded)
+
+    expected = 1.0 / frame_rate if frame_rate > 0 else 0.0
+    total_transitions = 0
+    non_increasing = 0
+    large_gaps = 0
+    usable_segments = 0
+    bad_segments = 0
+    segments: list[dict[str, Any]] = []
+    for position in positions:
+        interval = f"{position:.3f}%+{SAMPLE_SECONDS}"
+        output = run_capture(
+            [
+                FFPROBE, "-v", "error", "-select_streams", "v:0",
+                "-read_intervals", interval, "-show_frames", "-show_entries",
+                "frame=pts_time", "-of", "json", str(path),
+            ],
+            "ffprobe decoded frame sampling",
+        )
+        timestamps = []
+        for frame in json.loads(output).get("frames", []):
+            try:
+                timestamps.append(float(frame["pts_time"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        segment_total = max(0, len(timestamps) - 1)
+        segment_bad = 0
+        segment_gaps = 0
+        for before, after in zip(timestamps, timestamps[1:]):
+            delta = after - before
+            if delta <= 0:
+                segment_bad += 1
+            elif expected > 0 and delta > expected * 1.8:
+                segment_gaps += 1
+        if segment_total >= 20:
+            usable_segments += 1
+            threshold = max(3, int(segment_total * 0.05))
+            if segment_bad >= threshold:
+                bad_segments += 1
+        total_transitions += segment_total
+        non_increasing += segment_bad
+        large_gaps += segment_gaps
+        segments.append({
+            "position": position,
+            "transitions": segment_total,
+            "non_increasing": segment_bad,
+            "large_gaps": segment_gaps,
+        })
+
+    diagnostics = {
+        "detector": "decoded_display_pts",
+        "transitions": total_transitions,
+        "non_increasing": non_increasing,
+        "large_gaps": large_gaps,
+        "usable_segments": usable_segments,
+        "bad_segments": bad_segments,
+        "segments": segments,
+    }
+    if total_transitions < MINIMUM_PACKETS or usable_segments == 0:
+        return total_transitions, non_increasing, "uncertain", diagnostics
+    required_segments = 1 if duration <= SAMPLE_SECONDS * 3 else 2
+    if bad_segments >= required_segments:
+        return total_transitions, non_increasing, "issue", diagnostics
+    if bad_segments == 0 and non_increasing == 0:
+        return total_transitions, non_increasing, "healthy", diagnostics
+    return total_transitions, non_increasing, "uncertain", diagnostics
+
+
 def analyze(path: Path) -> Analysis:
     info = media_info(path)
+    kind = container_kind(path, info)
     videos = primary_videos(info)
-    chapter_issue = has_empty_full_duration_chapter(info)
+    chapter_issue = kind == "mp4" and has_empty_full_duration_chapter(info)
     if not videos:
-        return Analysis("Skipped", "No primary video stream", info, None)
+        return Analysis(
+            "Skipped", REASON_LABELS["no_video"], info, None,
+            container=kind, issue_category="unsupported", reason_code="no_video",
+        )
     video = videos[0]
     comparable = different = 0
     timestamp_issue = False
-    timestamp_reason = ""
+    timestamp_reason_code = ""
+    diagnostics: dict[str, Any] = {}
     if video.get("codec_name") == "h264" and int(video.get("has_b_frames", 0) or 0) > 0:
         duration = float(info.get("format", {}).get("duration", 0.0) or 0.0)
-        comparable, different = timestamp_sample(path, duration)
-        if comparable < MINIMUM_PACKETS:
-            timestamp_reason = "Too few comparable packet timestamps"
-        elif different == 0:
+        frame_rate = fraction(video.get("avg_frame_rate") or video.get("r_frame_rate"))
+        if kind == "mp4":
+            packet_total, packet_offsets = timestamp_sample(path, duration)
+            diagnostics["packet_timestamps"] = {
+                "comparable": packet_total, "different": packet_offsets,
+            }
+        comparable, different, verdict, frame_diagnostics = decoded_timeline_sample(
+            path, duration, frame_rate,
+        )
+        diagnostics.update(frame_diagnostics)
+        if verdict == "issue":
             timestamp_issue = True
+        elif verdict == "uncertain":
+            timestamp_reason_code = "too_few_samples" if comparable < MINIMUM_PACKETS else "ambiguous_timeline"
 
     problems = []
     if timestamp_issue:
-        problems.append("H.264 B-frame composition timestamps are missing")
+        problems.append(REASON_LABELS["timeline_bframe_pts"])
     if chapter_issue:
-        problems.append("A single untitled chapter spans the full file")
+        problems.append(REASON_LABELS["chapter_full_duration"])
     if problems:
+        category = "multiple" if len(problems) > 1 else ("timeline" if timestamp_issue else "chapter")
+        reason_code = (
+            "timeline_and_chapter" if len(problems) > 1
+            else ("timeline_bframe_pts" if timestamp_issue else "chapter_full_duration")
+        )
         return Analysis(
             "Candidate", "; ".join(problems), info, video, comparable, different,
-            timestamp_issue, chapter_issue,
+            timestamp_issue, chapter_issue, kind, category, reason_code, diagnostics,
         )
-    if timestamp_reason:
-        return Analysis("Uncertain", timestamp_reason, info, video, comparable, different)
+    if timestamp_reason_code:
+        return Analysis(
+            "Uncertain", REASON_LABELS[timestamp_reason_code], info, video, comparable, different,
+            container=kind, issue_category="unsupported", reason_code=timestamp_reason_code,
+            diagnostics=diagnostics,
+        )
     if video.get("codec_name") != "h264":
-        return Analysis("Skipped", "Primary video is not H.264 and no chapter issue was found", info, video)
+        return Analysis(
+            "Skipped", REASON_LABELS["unsupported_codec"], info, video,
+            container=kind, issue_category="unsupported", reason_code="unsupported_codec",
+        )
     if int(video.get("has_b_frames", 0) or 0) <= 0:
-        return Analysis("Healthy", "H.264 stream does not declare B-frames", info, video)
-    return Analysis("Healthy", "Composition timestamps are present", info, video, comparable, different)
+        return Analysis(
+            "Healthy", REASON_LABELS["no_b_frames"], info, video,
+            container=kind, reason_code="no_b_frames",
+        )
+    return Analysis(
+        "Healthy", REASON_LABELS["timestamps_present"], info, video, comparable, different,
+        container=kind, reason_code="timestamps_present", diagnostics=diagnostics,
+    )
 
 
 def compatibility_reason(analysis: Analysis) -> str:
+    if analysis.container == "mkv" and analysis.timestamp_issue and not REPAIR_MKV_TIMESTAMPS:
+        return "MKV 时间戳修复已由配置关闭"
     videos = primary_videos(analysis.info)
     if len(videos) != 1:
-        return "Exactly one primary video stream is required"
+        return "自动修复要求文件中只有一个主视频流"
     if analysis.timestamp_issue:
         avg = fraction(analysis.video.get("avg_frame_rate") if analysis.video else None)
         nominal = fraction(analysis.video.get("r_frame_rate") if analysis.video else None)
         if avg <= 0 or nominal <= 0 or abs(avg - nominal) > max(0.001, nominal * 0.005):
-            return "Variable or ambiguous frame rate is not repaired automatically"
+            return "可变或不明确的帧率暂不支持自动修复"
     bad_subtitles = [
         stream
         for stream in analysis.info.get("streams", [])
-        if stream.get("codec_type") == "subtitle" and stream.get("codec_name") != "mov_text"
+        if analysis.container == "mp4"
+        and stream.get("codec_type") == "subtitle" and stream.get("codec_name") != "mov_text"
     ]
     if bad_subtitles:
-        return "Non-mov_text subtitles cannot be safely copied into MP4"
+        return "MP4 中的非 mov_text 字幕无法安全无损复制"
     return ""
 
 
-def sha256(path: Path) -> str:
+def sha256(
+    path: Path,
+    *,
+    stage: str = "",
+    overall_start: float | None = None,
+    overall_end: float | None = None,
+) -> str:
     digest = hashlib.sha256()
+    total = max(1, path.stat().st_size)
+    processed = 0
     with path.open("rb") as source:
         while block := source.read(8 * 1024 * 1024):
             digest.update(block)
+            processed += len(block)
+            if stage and overall_start is not None and overall_end is not None:
+                ratio = min(1.0, processed / total)
+                report_task(
+                    stage, stage_progress=ratio * 100,
+                    overall_progress=overall_start + (overall_end - overall_start) * ratio,
+                )
     return digest.hexdigest().upper()
+
+
+def copyfile_progress(
+    source: Path,
+    destination: Path,
+    *,
+    overall_start: float,
+    overall_end: float,
+) -> None:
+    total = max(1, source.stat().st_size)
+    processed = 0
+    with source.open("rb") as reader, destination.open("wb") as writer:
+        while block := reader.read(8 * 1024 * 1024):
+            writer.write(block)
+            processed += len(block)
+            ratio = min(1.0, processed / total)
+            report_task(
+                "正在复制修复文件", stage_progress=ratio * 100,
+                overall_progress=overall_start + (overall_end - overall_start) * ratio,
+            )
+
+
+def packet_payload_fingerprints(path: Path, info: dict[str, Any]) -> dict[str, tuple[int, str]]:
+    """Hash the ordered compressed packet payloads for every non-video stream."""
+    global CURRENT_CHILD
+    stream_keys: dict[int, str] = {}
+    ordinals: dict[str, int] = {}
+    for stream in info.get("streams", []):
+        stream_type = str(stream.get("codec_type", "unknown"))
+        if stream_type == "video":
+            continue
+        ordinal = ordinals.get(stream_type, 0)
+        ordinals[stream_type] = ordinal + 1
+        stream_keys[int(stream.get("index", -1))] = f"{stream_type}:{ordinal}"
+    if not stream_keys:
+        return {}
+    digests = {key: hashlib.sha256() for key in stream_keys.values()}
+    counts = {key: 0 for key in stream_keys.values()}
+    CURRENT_CHILD = subprocess.Popen(
+        [
+            FFPROBE, "-v", "error", "-show_packets", "-show_data_hash", "sha256",
+            "-show_entries", "packet=stream_index,data_hash", "-of", "compact=p=0:nk=0",
+            str(path),
+        ],
+        text=True, encoding="utf-8", errors="replace",
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    assert CURRENT_CHILD.stdout is not None
+    for line in CURRENT_CHILD.stdout:
+        fields = dict(part.split("=", 1) for part in line.strip().split("|") if "=" in part)
+        try:
+            stream_index = int(fields.get("stream_index", "-1"))
+            data_hash = fields.get("data_hash", "").split(":", 1)[1]
+            key = stream_keys[stream_index]
+            digests[key].update(bytes.fromhex(data_hash))
+            counts[key] += 1
+        except (KeyError, ValueError, IndexError):
+            continue
+    stderr = CURRENT_CHILD.stderr.read() if CURRENT_CHILD.stderr is not None else ""
+    code = CURRENT_CHILD.wait()
+    CURRENT_CHILD = None
+    if code != 0:
+        raise RuntimeError(f"ffprobe packet payload hashing failed (exit {code}): {stderr.strip()}"[:MAX_ERROR_LENGTH])
+    return {key: (counts[key], digests[key].hexdigest()) for key in sorted(digests)}
 
 
 def assert_free_space(input_size: int) -> None:
@@ -301,7 +641,7 @@ def assert_free_space(input_size: int) -> None:
 
 
 def compare_streams(original: Analysis, fixed: Analysis) -> None:
-    if original.timestamp_issue and (fixed.timestamp_issue or fixed.different <= 0):
+    if original.timestamp_issue and (fixed.timestamp_issue or fixed.status != "Healthy"):
         raise RepairValidationError(f"Timestamp repair validation failed: {fixed.reason}")
     if original.chapter_issue and has_empty_full_duration_chapter(fixed.info):
         raise RepairValidationError("Invalid full-duration chapter remains after repair")
@@ -330,6 +670,23 @@ def compare_streams(original: Analysis, fixed: Analysis) -> None:
     for index, (before, after) in enumerate(zip(before_subtitles, after_subtitles)):
         if str(before.get("codec_name")) != str(after.get("codec_name")):
             raise RepairValidationError(f"Subtitle stream {index} codec changed unexpectedly")
+
+    for stream_type in ("attachment", "data"):
+        before_streams = [s for s in original.info.get("streams", []) if s.get("codec_type") == stream_type]
+        after_streams = [s for s in fixed.info.get("streams", []) if s.get("codec_type") == stream_type]
+        if original.container == "mkv" and len(before_streams) != len(after_streams):
+            raise RepairValidationError(f"{stream_type.title()} stream count changed unexpectedly")
+        for index, (before, after) in enumerate(zip(before_streams, after_streams)):
+            if str(before.get("codec_name")) != str(after.get("codec_name")):
+                raise RepairValidationError(f"{stream_type.title()} stream {index} codec changed unexpectedly")
+            if stream_type == "attachment":
+                if str(before.get("extradata_hash")) != str(after.get("extradata_hash")):
+                    raise RepairValidationError(f"Attachment {index} content changed unexpectedly")
+                for tag in ("filename", "mimetype"):
+                    before_value = str((before.get("tags") or {}).get(tag, ""))
+                    after_value = str((after.get("tags") or {}).get(tag, ""))
+                    if before_value != after_value:
+                        raise RepairValidationError(f"Attachment {index} metadata changed unexpectedly: {tag}")
 
     before_chapters = original.info.get("chapters") or []
     after_chapters = fixed.info.get("chapters") or []
@@ -377,12 +734,13 @@ def safe_replace(original: Path, repaired: Path, original_analysis: Analysis) ->
             f"available {media_free / 1024**3:.1f} GiB"
         )
     token = uuid.uuid4().hex
-    stage = original.parent / f"MediaRepairStage-{token}.mp4"
-    backup = original.parent / f"MediaRepairBackup-{token}.mp4"
+    suffix = original.suffix.lower()
+    stage = original.parent / f"MediaRepairStage-{token}{suffix}"
+    backup = original.parent / f"MediaRepairBackup-{token}{suffix}"
     original_stat = original.stat()
     installed = False
     try:
-        shutil.copyfile(repaired, stage)
+        copyfile_progress(repaired, stage, overall_start=88.0, overall_end=94.0)
         shutil.copystat(original, stage, follow_symlinks=True)
         try:
             os.chown(stage, original_stat.st_uid, original_stat.st_gid)
@@ -393,8 +751,10 @@ def safe_replace(original: Path, repaired: Path, original_analysis: Analysis) ->
             os.fsync(handle.fileno())
         if stage.stat().st_size != repaired.stat().st_size:
             raise RuntimeError("Staged file length does not match repaired file")
-        local_hash = sha256(repaired)
-        if sha256(stage) != local_hash:
+        local_hash = sha256(
+            repaired, stage="正在计算修复文件哈希", overall_start=94.0, overall_end=96.0,
+        )
+        if sha256(stage, stage="正在验证暂存文件哈希", overall_start=96.0, overall_end=98.0) != local_hash:
             raise RuntimeError("Staged file SHA-256 does not match repaired file")
 
         os.replace(original, backup)
@@ -421,17 +781,21 @@ def repair_one(path: Path, original: Analysis) -> tuple[str, int]:
     if reason:
         raise RuntimeError(reason)
     size = path.stat().st_size
+    duration = float(original.info.get("format", {}).get("duration", 0.0) or 0.0)
     assert_free_space(size)
     job = Path(tempfile.mkdtemp(prefix="job-", dir=WORK_ROOT))
     raw = job / "video.h264"
     video_only = job / "video-fixed.mp4"
-    repaired = job / "repaired.mp4"
+    repaired = job / f"repaired{path.suffix.lower()}"
+    verified_raw = job / "video-verified.h264"
     success = False
     try:
+        report_task("正在记录非视频流指纹", stage_progress=None, overall_progress=2.0)
+        original_payloads = packet_payload_fingerprints(path, original.info)
         if original.timestamp_issue:
             nominal_fps = str(original.video.get("r_frame_rate") or original.video.get("avg_frame_rate"))
             LOG.info("Extracting H.264 without re-encoding: %s", path)
-            run_logged(
+            run_ffmpeg_progress(
                 [
                     FFMPEG,
                     "-nostdin",
@@ -453,16 +817,19 @@ def repair_one(path: Path, original: Analysis) -> tuple[str, int]:
                 ],
                 job / "extract",
                 "H.264 extraction",
+                duration,
+                "正在无损抽取视频",
+                5.0,
+                25.0,
             )
             LOG.info("Rebuilding composition timestamps: %s", path)
+            report_task("正在重建显示时间戳", stage_progress=None, overall_progress=30.0)
             run_logged(
                 [MP4BOX, "-tmp", str(job), "-add", f"{raw}:fps={nominal_fps}", "-new", str(video_only)],
                 job / "mp4box",
                 "MP4Box timestamp rebuild",
             )
-            if not KEEP_TEMP_ON_FAILURE:
-                raw.unlink(missing_ok=True)
-
+            report_task("显示时间戳重建完成", stage_progress=100.0, overall_progress=40.0)
         LOG.info(
             "%s: %s",
             "Removing invalid full-duration chapter" if original.chapter_issue else "Preserving valid chapters",
@@ -476,21 +843,59 @@ def repair_one(path: Path, original: Analysis) -> tuple[str, int]:
                 "-map_metadata", "1", "-map_metadata:s:v:0", "1:s:v:0",
                 "-map_chapters", "-1" if original.chapter_issue else "1",
             ])
+            if original.container == "mkv":
+                remux.extend(["-map", "1:t?", "-map", "1:d?"])
+                attachments = [
+                    stream for stream in original.info.get("streams", [])
+                    if stream.get("codec_type") == "attachment"
+                ]
+                for attachment_index, stream in enumerate(attachments):
+                    tags = stream.get("tags") or {}
+                    for tag in ("filename", "mimetype"):
+                        value = str(tags.get(tag, ""))
+                        if value:
+                            remux.extend([f"-metadata:s:t:{attachment_index}", f"{tag}={value}"])
         else:
             remux.extend([
                 "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
                 "-map_metadata", "0", "-map_metadata:s:v:0", "0:s:v:0",
                 "-map_chapters", "-1" if original.chapter_issue else "0",
             ])
-        remux.extend([
-            "-c", "copy", "-movflags", "+faststart", "-avoid_negative_ts", "disabled", str(repaired),
-        ])
-        run_logged(remux, job / "remux", "final remux")
+        remux.extend(["-c", "copy"])
+        if original.container == "mp4":
+            remux.extend(["-movflags", "+faststart"])
+        remux.extend(["-avoid_negative_ts", "disabled", str(repaired)])
+        run_ffmpeg_progress(
+            remux, job / "remux", "final remux", duration,
+            "正在重新封装媒体流", 40.0, 62.0,
+        )
+        if original.timestamp_issue:
+            run_ffmpeg_progress(
+                [
+                    FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(repaired), "-map", "0:v:0", "-c:v", "copy",
+                    "-bsf:v", "h264_mp4toannexb", "-f", "h264", str(verified_raw),
+                ],
+                job / "verify-bitstream",
+                "video bitstream verification extraction",
+                duration,
+                "正在验证视频码流",
+                62.0,
+                72.0,
+            )
+            report_task("正在比较视频码流哈希", stage_progress=None, overall_progress=74.0)
+            if sha256(raw) != sha256(verified_raw):
+                raise RepairValidationError("Video bitstream SHA-256 changed during timestamp rebuild")
+        report_task("正在验证时间轴和媒体流", stage_progress=None, overall_progress=78.0)
         fixed = analyze(repaired)
+        if packet_payload_fingerprints(repaired, fixed.info) != original_payloads:
+            raise RepairValidationError("A copied non-video stream packet payload changed unexpectedly")
         compare_streams(original, fixed)
         duration = float(fixed.info.get("format", {}).get("duration", 0.0) or 0.0)
         validate_decode(repaired, duration, job)
+        report_task("正在安全替换原文件", stage_progress=None, overall_progress=88.0)
         final_hash = safe_replace(path, repaired, original)
+        report_task("修复完成", stage_progress=100.0, overall_progress=100.0, eta_seconds=0.0)
         success = True
         dropped_data = sum(1 for s in original.info.get("streams", []) if s.get("codec_type") == "data")
         LOG.info("Repaired and replaced: %s SHA256=%s", path, final_hash)
@@ -533,26 +938,35 @@ class State:
         different: int = 0,
         dropped_data: int = 0,
         final_hash: str = "",
+        analysis: Analysis | None = None,
     ) -> None:
         reason = compact_error(reason)
+        kind = analysis.container if analysis else container_kind(path)
+        category = analysis.issue_category if analysis else ("failed" if status == "Failed" else "none")
+        reason_code = analysis.reason_code if analysis else ("processing_failed" if status == "Failed" else "unknown")
+        diagnostics = json.dumps(analysis.diagnostics or {}, ensure_ascii=False, separators=(",", ":")) if analysis else "{}"
         self.db.execute(
             """
             INSERT INTO files(
               path,size,mtime_ns,ctime_ns,device,inode,status,reason,checked_at,
-              comparable,different,dropped_data,sha256,analysis_signature
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              comparable,different,dropped_data,sha256,analysis_signature,
+              file_id,container,issue_category,reason_code,diagnostics_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(path) DO UPDATE SET
               size=excluded.size,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,
               device=excluded.device,inode=excluded.inode,status=excluded.status,
               reason=excluded.reason,checked_at=excluded.checked_at,
               comparable=excluded.comparable,different=excluded.different,
               dropped_data=excluded.dropped_data,sha256=excluded.sha256,
-              analysis_signature=excluded.analysis_signature
+              analysis_signature=excluded.analysis_signature,file_id=excluded.file_id,
+              container=excluded.container,issue_category=excluded.issue_category,
+              reason_code=excluded.reason_code,diagnostics_json=excluded.diagnostics_json
             """,
             (
                 str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
                 stat.st_dev, stat.st_ino, status, reason, time.time(), comparable,
-                different, dropped_data, final_hash, ANALYSIS_SIGNATURE,
+                different, dropped_data, final_hash, analysis_signature_for(path),
+                file_identifier(path), kind, category, reason_code, diagnostics,
             ),
         )
         self.db.commit()
@@ -573,17 +987,27 @@ class State:
             )
         self.db.commit()
 
-    def enqueue(self, path: Path, kind: str, eligible_at: float, force: bool) -> None:
+    def enqueue(
+        self,
+        path: Path,
+        kind: str,
+        eligible_at: float,
+        force: bool,
+        requested_action: str = "inspect",
+    ) -> None:
         now = time.time()
         self.db.execute(
             """
-            INSERT INTO pending(path,event_kind,queued_at,eligible_at,force,attempts)
-            VALUES(?,?,?,?,?,0)
+            INSERT INTO pending(path,event_kind,queued_at,eligible_at,force,attempts,requested_action)
+            VALUES(?,?,?,?,?,0,?)
             ON CONFLICT(path) DO UPDATE SET
               event_kind=excluded.event_kind,queued_at=excluded.queued_at,
-              eligible_at=excluded.eligible_at,force=MAX(pending.force,excluded.force)
+              eligible_at=excluded.eligible_at,force=MAX(pending.force,excluded.force),
+              requested_action=CASE
+                WHEN pending.requested_action='repair' OR excluded.requested_action='repair' THEN 'repair'
+                ELSE 'inspect' END
             """,
-            (str(path), kind, now, eligible_at, int(force)),
+            (str(path), kind, now, eligible_at, int(force), requested_action),
         )
         self.db.commit()
         WAKE_EVENT.set()
@@ -699,6 +1123,39 @@ class State:
         )
         self.db.commit()
 
+    def due_control_command(self) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM control_commands WHERE state='queued' ORDER BY id LIMIT 1"
+        ).fetchone()
+
+    def start_control_command(self, command_id: int) -> None:
+        self.db.execute(
+            "UPDATE control_commands SET state='running',started_at=? WHERE id=? AND state='queued'",
+            (time.time(), command_id),
+        )
+        self.db.commit()
+
+    def finish_control_command(self, command_id: int, state: str, code: str, detail: str) -> None:
+        self.db.execute(
+            "UPDATE control_commands SET state=?,finished_at=?,result_code=?,result_detail=? WHERE id=?",
+            (state, time.time(), code, compact_error(detail), command_id),
+        )
+        self.db.execute(
+            "DELETE FROM control_commands WHERE id IN "
+            "(SELECT id FROM control_commands ORDER BY id DESC LIMIT -1 OFFSET 1000)"
+        )
+        self.db.commit()
+
+    def paths_for_file_ids(self, file_ids: list[str]) -> list[Path]:
+        if not file_ids:
+            return []
+        placeholders = ",".join("?" for _ in file_ids)
+        rows = self.db.execute(
+            f"SELECT path FROM files WHERE file_id IN ({placeholders})",
+            file_ids,
+        ).fetchall()
+        return [Path(str(row["path"])) for row in rows]
+
     def transfer_rename(self, source: Path, destination: Path) -> bool:
         row = self.get(source)
         if row is None or not destination.exists():
@@ -708,7 +1165,7 @@ class State:
         same_file = (
             row["device"] == stat.st_dev and row["inode"] == stat.st_ino
             and row["size"] == stat.st_size and row["mtime_ns"] == stat.st_mtime_ns
-            and row["analysis_signature"] == ANALYSIS_SIGNATURE
+            and row["analysis_signature"] == analysis_signature_for(destination)
             and cacheable_status(str(row["status"]))
         )
         if not same_file:
@@ -722,8 +1179,11 @@ class State:
         )
         self.db.execute("DELETE FROM files WHERE path=?", (str(destination),))
         self.db.execute(
-            "UPDATE files SET path=?,ctime_ns=? WHERE path=?",
-            (str(destination), stat.st_ctime_ns, str(source)),
+            "UPDATE files SET path=?,file_id=?,ctime_ns=?,container=? WHERE path=?",
+            (
+                str(destination), file_identifier(destination), stat.st_ctime_ns,
+                container_kind(destination), str(source),
+            ),
         )
         self.db.commit()
         return True
@@ -779,7 +1239,55 @@ def create_schema(connection: sqlite3.Connection) -> None:
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS control_commands (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          action TEXT NOT NULL,
+          file_ids_json TEXT NOT NULL DEFAULT '[]',
+          requested_at REAL NOT NULL,
+          started_at REAL,
+          finished_at REAL,
+          state TEXT NOT NULL DEFAULT 'queued',
+          result_code TEXT NOT NULL DEFAULT '',
+          result_detail TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_control_commands_state ON control_commands(state,id);
         """
+    )
+    file_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(files)")}
+    for name, definition in (
+        ("file_id", "TEXT NOT NULL DEFAULT ''"),
+        ("container", "TEXT NOT NULL DEFAULT 'mp4'"),
+        ("issue_category", "TEXT NOT NULL DEFAULT 'none'"),
+        ("reason_code", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("diagnostics_json", "TEXT NOT NULL DEFAULT '{}'")
+    ):
+        if name not in file_columns:
+            connection.execute(f"ALTER TABLE files ADD COLUMN {name} {definition}")
+    pending_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(pending)")}
+    if "requested_action" not in pending_columns:
+        connection.execute("ALTER TABLE pending ADD COLUMN requested_action TEXT NOT NULL DEFAULT 'inspect'")
+    connection.execute("UPDATE files SET file_id=substr(lower(hex(randomblob(12))),1,24) WHERE file_id='' ")
+    connection.execute("UPDATE files SET container='mkv' WHERE lower(path) LIKE '%.mkv'")
+    connection.execute(
+        "UPDATE files SET analysis_signature=? WHERE container='mp4' AND analysis_signature LIKE '3:%'",
+        (MP4_ANALYSIS_SIGNATURE,),
+    )
+    connection.execute(
+        "UPDATE files SET issue_category='timeline',reason_code='timeline_bframe_pts' "
+        "WHERE reason_code='unknown' AND reason LIKE '%composition timestamp%'"
+    )
+    connection.execute(
+        "UPDATE files SET issue_category='chapter',reason_code='chapter_full_duration' "
+        "WHERE reason_code='unknown' AND reason LIKE '%full-duration chapter%'"
+    )
+    connection.execute(
+        "UPDATE files SET issue_category='failed',reason_code='processing_failed' "
+        "WHERE status='Failed' AND reason_code='unknown'"
+    )
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_file_id ON files(file_id)")
+    connection.execute(
+        "INSERT INTO metadata(key,value) VALUES('schema_version','3') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
     )
     connection.commit()
 
@@ -796,6 +1304,7 @@ def migrate_legacy_state(path: Path) -> None:
         return
     source = sqlite3.connect(path)
     source.row_factory = sqlite3.Row
+    target: sqlite3.Connection | None = None
     try:
         columns = {str(row[1]) for row in source.execute("PRAGMA table_info(files)")}
         if "analysis_signature" in columns:
@@ -822,18 +1331,23 @@ def migrate_legacy_state(path: Path) -> None:
             status = str(row["status"])
             if unchanged and cacheable_status(status):
                 target.execute(
-                    "INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    """INSERT INTO files(
+                       path,size,mtime_ns,ctime_ns,device,inode,status,reason,checked_at,
+                       comparable,different,dropped_data,sha256,analysis_signature,
+                       file_id,container,issue_category,reason_code,diagnostics_json
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         str(media), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
                         stat.st_dev, stat.st_ino, status, compact_error(str(row["reason"])),
                         float(row["checked_at"]), int(row["comparable"]), int(row["different"]),
-                        int(row["dropped_data"]), str(row["sha256"]), ANALYSIS_SIGNATURE,
+                        int(row["dropped_data"]), str(row["sha256"]), analysis_signature_for(media),
+                        file_identifier(media), container_kind(media), "none", "unknown", "{}",
                     ),
                 )
                 migrated += 1
             else:
                 target.execute(
-                    "INSERT INTO pending VALUES(?,?,?,?,?,?)",
+                    "INSERT INTO pending(path,event_kind,queued_at,eligible_at,force,attempts,requested_action) VALUES(?,?,?,?,?,?,'inspect')",
                     (str(media), "migration-retry", now, now, 1, 0),
                 )
                 queued += 1
@@ -841,13 +1355,15 @@ def migrate_legacy_state(path: Path) -> None:
             "INSERT INTO events(event_time,path,status,reason) VALUES(?,?,?,?)",
             (now, "", "Migration", f"Imported {migrated} cached records; queued {queued} files"),
         )
-        target.execute("INSERT INTO metadata VALUES('schema_version','2')")
         target.commit()
         integrity = target.execute("PRAGMA integrity_check").fetchone()[0]
         if integrity != "ok":
             raise RuntimeError(f"New state database failed integrity check: {integrity}")
         target.close()
+        target = None
     except Exception:
+        if target is not None:
+            target.close()
         temporary = path.with_name("state-v2.sqlite3.tmp")
         temporary.unlink(missing_ok=True)
         raise
@@ -900,7 +1416,7 @@ def cacheable_status(status: str) -> bool:
 def cache_matches(row: sqlite3.Row, stat: os.stat_result) -> bool:
     return (
         cacheable_status(str(row["status"]))
-        and row["analysis_signature"] == ANALYSIS_SIGNATURE
+        and row["analysis_signature"] == analysis_signature_for(Path(str(row["path"])))
         and row["size"] == stat.st_size
         and row["mtime_ns"] == stat.st_mtime_ns
         and row["ctime_ns"] == stat.st_ctime_ns
@@ -911,9 +1427,9 @@ def cache_matches(row: sqlite3.Row, stat: os.stat_result) -> bool:
 
 def matches_media(path: Path) -> bool:
     name = path.name
-    if not name.lower().endswith(".mp4"):
+    if path.suffix.lower() not in {".mp4", ".mkv"}:
         return False
-    if name.startswith(("TimestampRepairStage-", "TimestampRepairBackup-")):
+    if name.startswith(("TimestampRepairStage-", "TimestampRepairBackup-", "MediaRepairStage-", "MediaRepairBackup-")):
         return False
     return not NAME_CONTAINS or NAME_CONTAINS.casefold() in name.casefold()
 
@@ -972,6 +1488,12 @@ class Runtime:
         self.watcher_error = ""
         self.current_path = ""
         self.current_action = "idle"
+        self.current_stage = ""
+        self.stage_progress: float | None = None
+        self.overall_progress: float | None = None
+        self.current_speed = ""
+        self.eta_seconds: float | None = None
+        self.task_started_at = 0.0
         self.last_reconcile = 0.0
         self.next_reconcile = 0.0
         self.processed_session = 0
@@ -985,6 +1507,12 @@ class Runtime:
                 "pid": os.getpid(), "time": time.time(), "auto_repair": AUTO_REPAIR,
                 "watcher_active": self.watcher_active, "watcher_error": self.watcher_error,
                 "current_path": self.current_path, "current_action": self.current_action,
+                "current_stage": self.current_stage,
+                "stage_progress": self.stage_progress,
+                "overall_progress": self.overall_progress,
+                "speed": self.current_speed,
+                "eta_seconds": self.eta_seconds,
+                "task_started_at": self.task_started_at,
                 "last_reconcile": self.last_reconcile, "next_reconcile": self.next_reconcile,
                 "processed_session": self.processed_session, "pending_count": self.pending_count,
                 "media_refresh_pending_count": self.media_refresh_pending_count,
@@ -1005,7 +1533,9 @@ def heartbeat_loop(runtime: Runtime) -> None:
             write_heartbeat(runtime)
         except OSError:
             LOG.exception("Unable to write heartbeat")
-        runtime.stop_event.wait(60)
+        with runtime.lock:
+            active = runtime.current_action != "idle"
+        runtime.stop_event.wait(1 if active else 10)
     try:
         write_heartbeat(runtime)
     except OSError:
@@ -1098,6 +1628,42 @@ def drain_events(state: State, events: queue.Queue[WatchEvent]) -> None:
             state.enqueue(event.source, event.kind, time.time() + FILE_SETTLE_SECONDS, True)
 
 
+def process_control_command(state: State, runtime: Runtime, row: sqlite3.Row) -> None:
+    command_id = int(row["id"])
+    action = str(row["action"])
+    state.start_control_command(command_id)
+    with runtime.lock:
+        runtime.current_action = "manual-command"
+        runtime.current_stage = "正在执行手动操作"
+        runtime.task_started_at = time.time()
+    try:
+        if action == "reconcile":
+            reconcile(state, runtime)
+            detail = "已完成新增和变化文件扫描"
+        elif action in {"recheck", "repair", "retry"}:
+            raw_ids = json.loads(str(row["file_ids_json"]) or "[]")
+            file_ids = [str(value) for value in raw_ids if str(value)][:100]
+            paths = state.paths_for_file_ids(file_ids)
+            requested_action = "repair" if action in {"repair", "retry"} else "inspect"
+            for path in paths:
+                if path.exists() and matches_media(path):
+                    state.enqueue(path, f"web-{action}", time.time(), True, requested_action)
+            detail = f"已加入队列：{len(paths)} 个文件"
+        else:
+            raise ValueError(f"Unsupported control action: {action}")
+    except Exception as exc:
+        state.finish_control_command(command_id, "failed", "command_failed", str(exc))
+        LOG.exception("Manual command failed: %s", action)
+    else:
+        state.finish_control_command(command_id, "succeeded", "queued", detail)
+    finally:
+        with runtime.lock:
+            runtime.current_action = "idle"
+            runtime.current_stage = ""
+            runtime.task_started_at = 0.0
+            runtime.pending_count = state.pending_count()
+
+
 def process_pending(
     state: State,
     runtime: Runtime,
@@ -1109,6 +1675,12 @@ def process_pending(
     with runtime.lock:
         runtime.current_action = "process"
         runtime.current_path = str(path)
+        runtime.current_stage = "正在分析文件"
+        runtime.stage_progress = None
+        runtime.overall_progress = 0.0
+        runtime.current_speed = ""
+        runtime.eta_seconds = None
+        runtime.task_started_at = time.time()
     try:
         stat = path.stat()
     except OSError:
@@ -1127,12 +1699,15 @@ def process_pending(
         result = analyze(path)
         dropped_data = sum(1 for stream in result.info.get("streams", []) if stream.get("codec_type") == "data")
         final_hash = ""
-        if result.status == "Candidate" and AUTO_REPAIR:
+        manual_repair = str(row["requested_action"] or "inspect") == "repair"
+        if result.status == "Candidate" and (AUTO_REPAIR or manual_repair):
             incompatible = compatibility_reason(result)
             if incompatible:
                 result = Analysis(
                     "Uncertain", incompatible, result.info, result.video,
                     result.comparable, result.different,
+                    container=result.container, issue_category="unsupported",
+                    reason_code="unsupported_streams", diagnostics=result.diagnostics,
                 )
             else:
                 try:
@@ -1143,26 +1718,35 @@ def process_pending(
                     result = Analysis(
                         "Uncertain", compact_error(str(exc)), result.info, result.video,
                         result.comparable, result.different,
+                        container=result.container, issue_category="unsupported",
+                        reason_code="ambiguous_timeline", diagnostics=result.diagnostics,
                     )
                 else:
                     stat = path.stat()
                     remember_internal_change(path, stat)
-                    completed = []
-                    if repaired_timestamp:
-                        completed.append("composition timestamps rebuilt")
-                    if repaired_chapter:
-                        completed.append("invalid full-duration chapter removed")
+                    if repaired_timestamp and repaired_chapter:
+                        reason_code = "repaired_multiple"
+                    elif repaired_timestamp:
+                        reason_code = "repaired_timeline"
+                    else:
+                        reason_code = "repaired_chapter"
                     result = Analysis(
                         "Repaired",
-                        "; ".join(completed)
-                        + "; streams copied without re-encoding and original replaced after validation",
+                        REASON_LABELS[reason_code] + "；所有媒体流均未重新编码，并已在完整校验后替换原文件",
                         result.info, result.video, result.comparable, result.different,
+                        container=result.container, issue_category=(
+                            "multiple" if repaired_timestamp and repaired_chapter
+                            else "timeline" if repaired_timestamp else "chapter"
+                        ), reason_code=reason_code, diagnostics=result.diagnostics,
                     )
-        state.save(path, stat, result.status, result.reason, result.comparable, result.different, dropped_data, final_hash)
+        state.save(
+            path, stat, result.status, result.reason, result.comparable, result.different,
+            dropped_data, final_hash, analysis=result,
+        )
         state.record(path, result.status, result.reason)
         if result.status == "Repaired" and media_refresh_enabled:
             state.enqueue_media_refresh(path)
-            state.record(path, "MediaRefreshQueued", "Media-library refresh queued after repair")
+            state.record(path, "MediaRefreshQueued", "修复完成，已加入媒体库刷新队列")
         state.complete(path)
         with runtime.lock:
             runtime.processed_session += 1
@@ -1179,6 +1763,12 @@ def process_pending(
         with runtime.lock:
             runtime.current_path = ""
             runtime.current_action = "idle"
+            runtime.current_stage = ""
+            runtime.stage_progress = None
+            runtime.overall_progress = None
+            runtime.current_speed = ""
+            runtime.eta_seconds = None
+            runtime.task_started_at = 0.0
             runtime.pending_count = state.pending_count()
             runtime.media_refresh_pending_count = state.media_refresh_pending_count()
 
@@ -1249,6 +1839,7 @@ def acquire_lock() -> int:
 
 
 def main() -> int:
+    global ACTIVE_RUNTIME
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true", help="Reconcile and process currently eligible files, then exit")
     parser.add_argument("--healthcheck", action="store_true")
@@ -1266,13 +1857,14 @@ def main() -> int:
     parse_reconcile_time(RECONCILE_LOCAL_TIME)
     for name in LEGACY_ENV_NAMES:
         if os.getenv(name) is not None:
-            LOG.warning("Legacy setting %s is ignored by version 2.0", name)
+            LOG.warning("Legacy setting %s is ignored by version 3.0", name)
 
     lock_descriptor = acquire_lock()
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     state = State(CONFIG_ROOT / "state.sqlite3")
     runtime = Runtime()
+    ACTIVE_RUNTIME = runtime
     media_refresh_client = EmbyRefreshClient.from_environment(MEDIA_ROOT)
     runtime.media_refresh_enabled = media_refresh_client is not None
     if media_refresh_client is not None:
@@ -1306,7 +1898,9 @@ def main() -> int:
                 show_full_paths=WEB_SHOW_FULL_PATHS,
                 settings={
                     "auto_repair": AUTO_REPAIR,
+                    "repair_mkv_timestamps": REPAIR_MKV_TIMESTAMPS,
                     "repair_empty_full_chapters": REPAIR_EMPTY_FULL_CHAPTERS,
+                    "supported_formats": ["MP4", "MKV"],
                     "media_refresh_enabled": media_refresh_client is not None,
                     "file_settle_seconds": FILE_SETTLE_SECONDS,
                     "min_file_age_seconds": MIN_FILE_AGE,
@@ -1314,19 +1908,25 @@ def main() -> int:
                     "name_filter_enabled": bool(NAME_CONTAINS),
                     "show_full_paths": WEB_SHOW_FULL_PATHS,
                 },
+                wake_callback=WAKE_EVENT.set,
             )
         except Exception:
             LOG.exception("Web UI failed to start; repair service will continue without it")
 
     LOG.info(
-        "Service 2.2 started: media=%s auto_repair=%s empty_full_chapters=%s media_refresh=%s reconcile=%s",
-        MEDIA_ROOT, AUTO_REPAIR, REPAIR_EMPTY_FULL_CHAPTERS,
+        "Service 3.0 started: media=%s auto_repair=%s mkv_timestamps=%s empty_full_chapters=%s media_refresh=%s reconcile=%s",
+        MEDIA_ROOT, AUTO_REPAIR, REPAIR_MKV_TIMESTAMPS, REPAIR_EMPTY_FULL_CHAPTERS,
         media_refresh_client is not None, RECONCILE_LOCAL_TIME,
     )
     try:
         reconcile(state, runtime)
         while not STOP_REQUESTED:
             drain_events(state, events)
+            command = state.due_control_command()
+            if command is not None:
+                process_control_command(state, runtime, command)
+                if not args.once:
+                    continue
             if time.time() >= runtime.next_reconcile:
                 reconcile(state, runtime)
             refresh_due = state.due_media_refresh(100 if args.once else 1) if media_refresh_client else []
@@ -1373,6 +1973,7 @@ def main() -> int:
         runtime.stop_event.set()
         heartbeat_thread.join(timeout=5)
         state.close()
+        ACTIVE_RUNTIME = None
         os.close(lock_descriptor)
     LOG.info("Service stopped")
     return 0

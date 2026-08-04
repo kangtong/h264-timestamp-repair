@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sqlite3
 import sys
@@ -81,6 +82,29 @@ class StateTests(unittest.TestCase):
             service.reconcile(self.state, runtime)
         self.assertEqual(0, self.state.pending_count())
 
+    def test_manual_repair_command_is_persistent_and_queues_repair_intent(self) -> None:
+        media = self.root / "manual.mkv"
+        media.write_bytes(b"content")
+        analysis = service.Analysis(
+            "Candidate", "timeline", {"streams": []}, {"codec_name": "h264"},
+            timestamp_issue=True, container="mkv", issue_category="timeline",
+            reason_code="timeline_bframe_pts",
+        )
+        self.state.save(media, media.stat(), "Candidate", "timeline", analysis=analysis)
+        file_id = str(self.state.get(media)["file_id"])
+        self.state.db.execute(
+            "INSERT INTO control_commands(action,file_ids_json,requested_at,state) VALUES(?,?,?,'queued')",
+            ("repair", json.dumps([file_id]), time.time()),
+        )
+        self.state.db.commit()
+        self.state.close()
+        self.state = service.State(self.root / "state.sqlite3")
+        command = self.state.due_control_command()
+        self.assertIsNotNone(command)
+        service.process_control_command(self.state, service.Runtime(), command)
+        pending = self.state.db.execute("SELECT requested_action FROM pending WHERE path=?", (str(media),)).fetchone()
+        self.assertEqual("repair", pending["requested_action"])
+
 
 class MigrationTests(unittest.TestCase):
     def test_legacy_migration_preserves_valid_cache_and_requeues_failure(self) -> None:
@@ -156,11 +180,14 @@ class UtilityTests(unittest.TestCase):
         info = self.media_info_with_chapter()
         with mock.patch.object(service, "media_info", return_value=info), mock.patch.object(
             service, "timestamp_sample", return_value=(60, 0),
+        ), mock.patch.object(
+            service, "decoded_timeline_sample", return_value=(60, 30, "issue", {"transitions": 60}),
         ):
             result = service.analyze(Path("sample.mp4"))
         self.assertEqual("Candidate", result.status)
         self.assertTrue(result.timestamp_issue)
         self.assertTrue(result.chapter_issue)
+        self.assertEqual("timeline_and_chapter", result.reason_code)
 
         info["streams"][0]["codec_name"] = "hevc"
         with mock.patch.object(service, "media_info", return_value=info), mock.patch.object(
@@ -172,6 +199,49 @@ class UtilityTests(unittest.TestCase):
         self.assertTrue(result.chapter_issue)
         sample.assert_not_called()
 
+    def test_unified_decoded_pts_detector_distinguishes_bad_and_good_mkv(self) -> None:
+        bad = {"frames": [{"pts_time": str(value)} for value in (
+            0.000, 0.100, 0.067, 0.133, 0.033, 0.167, 0.267, 0.234,
+            0.300, 0.200, 0.334, 0.434, 0.401, 0.467, 0.367,
+            0.501, 0.601, 0.568, 0.635, 0.535, 0.668, 0.768,
+        )]}
+        with mock.patch.object(service, "run_capture", side_effect=[json.dumps(bad)] * 3):
+            total, anomalies, verdict, _ = service.decoded_timeline_sample(
+                Path("bad.mkv"), 100.0, 30.0,
+            )
+        self.assertGreaterEqual(total, 60)
+        self.assertGreaterEqual(anomalies, 9)
+        self.assertEqual("issue", verdict)
+
+        good = {"frames": [{"pts_time": f"{index / 30:.6f}"} for index in range(30)]}
+        with mock.patch.object(service, "run_capture", side_effect=[json.dumps(good)] * 3):
+            _, anomalies, verdict, _ = service.decoded_timeline_sample(
+                Path("good.mkv"), 100.0, 30.0,
+            )
+        self.assertEqual(0, anomalies)
+        self.assertEqual("healthy", verdict)
+
+    def test_mp4_and_mkv_use_the_same_timeline_issue_code(self) -> None:
+        info = self.media_info_with_chapter(title="valid", start=5.0, end=80.0)
+        for name in ("sample.mp4", "sample.mkv"):
+            with self.subTest(name=name), mock.patch.object(
+                service, "media_info", return_value=info,
+            ), mock.patch.object(
+                service, "timestamp_sample", return_value=(60, 0),
+            ), mock.patch.object(
+                service, "decoded_timeline_sample",
+                return_value=(60, 30, "issue", {"transitions": 60}),
+            ):
+                result = service.analyze(Path(name))
+            self.assertEqual("Candidate", result.status)
+            self.assertEqual("timeline_bframe_pts", result.reason_code)
+            self.assertEqual("timeline", result.issue_category)
+
+    def test_media_matcher_accepts_mp4_and_mkv_only(self) -> None:
+        self.assertTrue(service.matches_media(Path("movie.mp4")))
+        self.assertTrue(service.matches_media(Path("movie.mkv")))
+        self.assertFalse(service.matches_media(Path("movie.avi")))
+
     def test_error_is_plain_and_bounded(self) -> None:
         value = "\x1b[31m" + "x" * 10000
         compact = service.compact_error(value)
@@ -181,6 +251,27 @@ class UtilityTests(unittest.TestCase):
     def test_mp4box_uses_work_job_as_temp_directory(self) -> None:
         source = Path(service.__file__).read_text(encoding="utf-8")
         self.assertIn('[MP4BOX, "-tmp", str(job), "-add"', source)
+        self.assertIn('f"-metadata:s:t:{attachment_index}"', source)
+
+    def test_mkv_attachment_content_hash_must_be_preserved(self) -> None:
+        video = {"codec_type": "video", "codec_name": "h264"}
+        original_info = {
+            "streams": [video, {
+                "codec_type": "attachment", "codec_name": None,
+                "extradata_hash": "SHA256:original",
+                "tags": {"filename": "font.ttf", "mimetype": "application/x-truetype-font"},
+            }],
+            "chapters": [],
+        }
+        fixed_info = json.loads(json.dumps(original_info))
+        fixed_info["streams"][1]["extradata_hash"] = "SHA256:changed"
+        original = service.Analysis(
+            "Candidate", "timeline", original_info, video,
+            timestamp_issue=True, container="mkv",
+        )
+        fixed = service.Analysis("Healthy", "ok", fixed_info, fixed_info["streams"][0], container="mkv")
+        with self.assertRaisesRegex(service.RepairValidationError, "Attachment 0 content changed"):
+            service.compare_streams(original, fixed)
 
     def test_deterministic_repair_validation_uses_distinct_error(self) -> None:
         original = service.Analysis(

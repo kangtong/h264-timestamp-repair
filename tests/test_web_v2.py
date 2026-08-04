@@ -53,6 +53,14 @@ class AnonymousWebTests(unittest.TestCase):
         with urllib.request.urlopen(self.base + path, timeout=5) as response:
             return response.status, response.read()
 
+    def post(self, path: str, payload: dict, *, origin: str = "") -> tuple[int, bytes]:
+        request = urllib.request.Request(
+            self.base + path, data=json.dumps(payload).encode("utf-8"), method="POST",
+            headers={"Content-Type": "application/json", **({"Origin": origin} if origin else {})},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, response.read()
+
     def test_page_and_apis_are_anonymous_and_paths_are_redacted(self) -> None:
         self.assertEqual(200, self.get("/")[0])
         status, body = self.get("/api/status")
@@ -62,7 +70,19 @@ class AnonymousWebTests(unittest.TestCase):
         item = json.loads(body)["items"][0]
         self.assertEqual("sample.mp4", item["path"])
         self.assertNotIn("private-path", body.decode("utf-8"))
+        self.assertEqual("正常", item["status_label"])
         self.assertEqual(200, self.get("/api/history")[0])
+
+    def test_manual_actions_are_persisted_and_cross_origin_is_rejected(self) -> None:
+        item = json.loads(self.get("/api/files")[1])["items"][0]
+        status, body = self.post("/api/files/actions/recheck", {"file_ids": [item["file_id"]]})
+        self.assertEqual(202, status)
+        self.assertTrue(json.loads(body)["accepted"])
+        row = self.state.db.execute("SELECT action,state FROM control_commands").fetchone()
+        self.assertEqual(("recheck", "queued"), tuple(row))
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.post("/api/actions/reconcile", {}, origin="https://example.invalid")
+        self.assertEqual(403, raised.exception.code)
 
     def test_csv_endpoint_is_removed(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as raised:
