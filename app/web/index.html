@@ -89,7 +89,7 @@
             <div class="panel-heading"><div><p class="section-kicker">媒体记录</p><h2>全部文件</h2></div><p id="file-result-count" class="result-count">—</p></div>
             <div class="toolbar">
               <label><span>搜索</span><input id="search-input" type="search" placeholder="文件名或原因" autocomplete="off"></label>
-              <label><span>状态</span><select id="status-filter"><option value="">全部状态</option><option value="Candidate">待修复</option><option value="Repaired">已修复</option><option value="Healthy">正常</option><option value="Uncertain">需要人工确认</option><option value="Skipped">已跳过</option><option value="Failed">处理失败</option></select></label>
+              <label><span>状态</span><select id="status-filter"><option value="">全部状态</option><option value="Candidate">待修复</option><option value="QueuedRepair">等待自动修复</option><option value="QueuedRecheck">等待自动复检</option><option value="Repaired">已修复</option><option value="Healthy">正常</option><option value="Uncertain">需要人工确认</option><option value="Skipped">已跳过</option><option value="Failed">处理失败</option></select></label>
               <label><span>格式</span><select id="format-filter"><option value="">全部格式</option><option value="mp4">MP4</option><option value="mkv">MKV</option></select></label>
             </div>
             <div id="file-results"></div>

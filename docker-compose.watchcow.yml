@@ -1,6 +1,6 @@
 services:
   video-integrity-repair:
-    image: ${DOCKER_IMAGE:-kangtong1993/h264-timestamp-repair:3.0.1}
+    image: ${DOCKER_IMAGE:-kangtong1993/h264-timestamp-repair:3.0.2}
     pull_policy: always
     container_name: video-integrity-repair
     restart: unless-stopped
@@ -43,7 +43,7 @@ services:
       watchcow.appname: "watchcow.video-integrity-repair"
       watchcow.display_name: "视频完整性修复"
       watchcow.desc: "检测并无损修复视频时间轴和章节元数据异常"
-      watchcow.version: "3.0.1"
+      watchcow.version: "3.0.2"
       watchcow.maintainer: "Video Integrity Repair"
       watchcow.service_port: "${WEB_UI_HOST_PORT:-18080}"
       watchcow.protocol: "http"

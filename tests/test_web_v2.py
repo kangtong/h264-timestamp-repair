@@ -89,6 +89,34 @@ class AnonymousWebTests(unittest.TestCase):
             self.get("/report.csv")
         self.assertEqual(404, raised.exception.code)
 
+    def test_queued_problem_is_not_reported_as_manual_confirmation(self) -> None:
+        media = self.root / "private-path" / "queued.mkv"
+        media.write_bytes(b"queued")
+        analysis = service_module.Analysis(
+            "Uncertain", "old validation result", {}, {}, 100, 50,
+            container="mkv", issue_category="unsupported", reason_code="ambiguous_timeline",
+        )
+        self.state.save(
+            media, media.stat(), analysis.status, analysis.reason,
+            analysis.comparable, analysis.different, analysis=analysis,
+        )
+        self.state.record(media, analysis.status, analysis.reason)
+        self.state.enqueue(media, "signature-recheck", time.time(), True, "repair")
+
+        summary = json.loads(self.get("/api/status")[1])["summary"]
+        self.assertEqual(1, summary["QueuedRepair"])
+        self.assertNotIn("unsupported", summary["issues"])
+
+        payload = json.loads(self.get("/api/files?status=QueuedRepair")[1])
+        self.assertEqual(1, payload["total"])
+        self.assertEqual("QueuedRepair", payload["items"][0]["status_code"])
+        self.assertEqual("等待自动修复", payload["items"][0]["status_label"])
+        self.assertEqual(0, json.loads(self.get("/api/files?problems=1")[1])["total"])
+
+        history = json.loads(self.get("/api/history")[1])["items"][0]
+        self.assertEqual("QueuedRepair", history["status"])
+        self.assertEqual("等待自动修复", history["status_label"])
+
 
 if __name__ == "__main__":
     unittest.main()

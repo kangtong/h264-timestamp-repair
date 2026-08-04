@@ -21,6 +21,12 @@ MP4 和 MKV 使用同一个时间轴完整性核心：最终依据是解码后�
 - 手动任务、扫描队列和媒体库刷新队列均持久化到 SQLite。
 - 修复完成并通过时间轴、码流哈希、流属性和抽样解码校验后才原子替换原文件。
 
+### 3.0.2 队列状态显示修正
+
+- 已进入后台队列的旧问题会显示为“等待自动修复”或“等待自动复检”，不再误计入“无法自动处理”
+- 问题分类只统计当前没有自动处理任务的真实待确认项目
+- 最近记录会结合当前队列状态，避免把历史检测结果误认为当前状态
+
 ### 3.0.1 自动判定改进
 
 - 明确达到异常阈值的文件继续自动修复，不因 Annex-B 参数单元的安全重排而误报。
@@ -41,7 +47,7 @@ curl -O https://raw.githubusercontent.com/kangtong/h264-timestamp-repair/main/do
 
 ```dotenv
 MEDIA_HOST_PATH=/srv/media
-DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:3.0.1
+DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:3.0.2
 TZ=Asia/Shanghai
 AUTO_REPAIR=false
 REPAIR_MKV_TIMESTAMPS=true
