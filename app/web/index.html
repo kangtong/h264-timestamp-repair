@@ -4,81 +4,82 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>视频完整性修复</title>
+  <title data-i18n="app.title">视频完整性修复</title>
   <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand"><span class="brand-mark">V</span><div><strong>视频完整性修复</strong><small>无损检测与修复</small></div></div>
-      <nav aria-label="功能菜单">
-        <button class="nav-button active" data-view="overview">概览</button>
-        <button class="nav-button" data-view="problems">问题文件</button>
-        <button class="nav-button" data-view="files">全部文件</button>
-        <button class="nav-button" data-view="tasks">任务中心</button>
-        <button class="nav-button" data-view="settings">运行设置</button>
+      <div class="brand"><span class="brand-mark">V</span><div><strong data-i18n="app.title">视频完整性修复</strong><small data-i18n="app.subtitle">无损检测与修复</small></div></div>
+      <nav aria-label="功能菜单" data-i18n-aria="nav.label">
+        <button class="nav-button active" data-view="overview" data-i18n="nav.overview">概览</button>
+        <button class="nav-button" data-view="problems" data-i18n="nav.problems">问题文件</button>
+        <button class="nav-button" data-view="files" data-i18n="nav.files">全部文件</button>
+        <button class="nav-button" data-view="tasks" data-i18n="nav.tasks">任务中心</button>
+        <button class="nav-button" data-view="settings" data-i18n="nav.settings">运行设置</button>
       </nav>
-      <p class="sidebar-note">界面无登录验证，请仅在可信局域网使用。</p>
+      <p class="sidebar-note" data-i18n="security.lan">界面无登录验证，请仅在可信局域网使用。</p>
     </aside>
 
     <div class="content-shell">
       <header class="topbar">
-        <div><p class="eyebrow">视频时间轴与元数据</p><h1 id="page-title">概览</h1></div>
+        <div><p class="eyebrow" data-i18n="header.eyebrow">视频时间轴与元数据</p><h1 id="page-title" data-i18n="nav.overview">概览</h1></div>
         <div class="header-actions">
-          <span id="service-state" class="state-pill neutral"><span class="state-dot"></span>正在连接</span>
-          <button id="scan-button" class="button primary" type="button">立即扫描变化</button>
-          <button id="refresh-button" class="button secondary" type="button">刷新页面</button>
+          <label class="language-picker"><span data-i18n="language.label">界面语言</span><select id="language-select" aria-label="界面语言" data-i18n-aria="language.label"><option value="zh-CN" data-i18n="language.zh">中文</option><option value="en" data-i18n="language.en">English</option></select></label>
+          <span id="service-state" class="state-pill neutral"><span class="state-dot"></span><span data-i18n="state.connecting">正在连接</span></span>
+          <button id="scan-button" class="button primary" type="button" data-i18n="action.scan">立即扫描变化</button>
+          <button id="refresh-button" class="button secondary" type="button" data-i18n="action.refresh">刷新页面</button>
         </div>
       </header>
 
       <main>
         <section id="view-overview" class="view active">
-          <div class="summary-grid" aria-label="状态汇总">
-            <article class="summary-card accent-blue"><span>已检查文件</span><strong id="count-total">—</strong><small>MP4 与 MKV</small></article>
-            <article class="summary-card accent-amber"><span>待修复</span><strong id="count-candidate">—</strong><small>安全候选文件</small></article>
-            <article class="summary-card accent-green"><span>已修复</span><strong id="count-repaired">—</strong><small>无损修复完成</small></article>
-            <article class="summary-card accent-red"><span>处理失败</span><strong id="count-failed">—</strong><small>可以手动重试</small></article>
+          <div class="summary-grid" aria-label="状态汇总" data-i18n-aria="summary.label">
+            <article class="summary-card accent-blue"><span data-i18n="summary.total">已检查文件</span><strong id="count-total">—</strong><small data-i18n="summary.totalHint">MP4 与 MKV</small></article>
+            <article class="summary-card accent-amber"><span data-i18n="summary.candidate">待修复</span><strong id="count-candidate">—</strong><small data-i18n="summary.candidateHint">安全候选文件</small></article>
+            <article class="summary-card accent-green"><span data-i18n="summary.repaired">已修复</span><strong id="count-repaired">—</strong><small data-i18n="summary.repairedHint">无损修复完成</small></article>
+            <article class="summary-card accent-red"><span data-i18n="summary.failed">处理失败</span><strong id="count-failed">—</strong><small data-i18n="summary.failedHint">可以手动重试</small></article>
           </div>
 
           <section class="panel task-panel">
-            <div class="panel-heading"><div><p class="section-kicker">当前工作</p><h2 id="task-stage">服务空闲</h2></div><span id="mode-pill" class="mode-pill">—</span></div>
+            <div class="panel-heading"><div><p class="section-kicker" data-i18n="work.current">当前工作</p><h2 id="task-stage">服务空闲</h2></div><span id="mode-pill" class="mode-pill">—</span></div>
             <div id="progress-track" class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
             <div class="progress-meta">
-              <div><span>当前文件</span><strong id="current-file">—</strong></div>
-              <div><span>进度</span><strong id="progress-text">等待状态</strong></div>
-              <div><span>速度与剩余时间</span><strong id="speed-eta">—</strong></div>
-              <div><span>等待队列</span><strong id="queue-text">—</strong></div>
+              <div><span data-i18n="work.file">当前文件</span><strong id="current-file">—</strong></div>
+              <div><span data-i18n="work.progress">进度</span><strong id="progress-text" data-i18n="work.waiting">等待状态</strong></div>
+              <div><span data-i18n="work.speed">速度与剩余时间</span><strong id="speed-eta">—</strong></div>
+              <div><span data-i18n="work.queue">等待队列</span><strong id="queue-text">—</strong></div>
             </div>
           </section>
 
           <div class="overview-grid">
             <section class="panel">
-              <div class="panel-heading"><div><p class="section-kicker">问题分类</p><h2>需要关注</h2></div><button class="text-button" data-open-view="problems">查看全部</button></div>
+              <div class="panel-heading"><div><p class="section-kicker" data-i18n="issues.kicker">问题分类</p><h2 data-i18n="issues.attention">需要关注</h2></div><button class="text-button" data-open-view="problems" data-i18n="action.viewAll">查看全部</button></div>
               <div id="issue-cards" class="issue-grid"></div>
             </section>
             <section class="panel">
-              <div class="panel-heading"><div><p class="section-kicker">重要事件</p><h2>最近处理</h2></div><button class="text-button" data-open-view="tasks">任务中心</button></div>
-              <ol id="history-list" class="history-list"><li class="empty-cell">暂无重要事件</li></ol>
+              <div class="panel-heading"><div><p class="section-kicker" data-i18n="events.kicker">重要事件</p><h2 data-i18n="events.recent">最近处理</h2></div><button class="text-button" data-open-view="tasks" data-i18n="nav.tasks">任务中心</button></div>
+              <ol id="history-list" class="history-list"><li class="empty-cell" data-i18n="empty.events">暂无重要事件</li></ol>
             </section>
           </div>
         </section>
 
         <section id="view-problems" class="view">
           <section class="panel">
-            <div class="panel-heading"><div><p class="section-kicker">按原因分类</p><h2>问题文件</h2></div></div>
+            <div class="panel-heading"><div><p class="section-kicker" data-i18n="problems.kicker">按原因分类</p><h2 data-i18n="nav.problems">问题文件</h2></div></div>
             <div id="issue-filter" class="chip-row">
-              <button class="chip active" data-issue="">全部问题</button>
-              <button class="chip" data-issue="timeline">时间轴异常</button>
-              <button class="chip" data-issue="chapter">章节异常</button>
-              <button class="chip" data-issue="multiple">多项异常</button>
-              <button class="chip" data-issue="unsupported">无法自动处理</button>
-              <button class="chip" data-issue="failed">处理失败</button>
+              <button class="chip active" data-issue="" data-i18n="filter.allIssues">全部问题</button>
+              <button class="chip" data-issue="timeline" data-i18n="filter.timeline">时间轴异常</button>
+              <button class="chip" data-issue="chapter" data-i18n="filter.chapter">章节异常</button>
+              <button class="chip" data-issue="multiple" data-i18n="filter.multiple">多项异常</button>
+              <button class="chip" data-issue="unsupported" data-i18n="filter.unsupported">无法自动处理</button>
+              <button class="chip" data-issue="failed" data-i18n="filter.failed">处理失败</button>
             </div>
             <div class="action-bar">
-              <span id="problem-selection">尚未选择文件</span>
-              <button id="recheck-selected" class="button secondary" type="button">重新检测</button>
-              <button id="repair-selected" class="button primary" type="button">无损修复</button>
-              <button id="retry-selected" class="button secondary" type="button">重试失败任务</button>
+              <span id="problem-selection" data-i18n="selection.none">尚未选择文件</span>
+              <button id="recheck-selected" class="button secondary" type="button" data-i18n="action.recheck">重新检测</button>
+              <button id="repair-selected" class="button primary" type="button" data-i18n="action.repair">无损修复</button>
+              <button id="retry-selected" class="button secondary" type="button" data-i18n="action.retry">重试失败任务</button>
             </div>
             <div id="problem-results"></div>
           </section>
@@ -86,11 +87,11 @@
 
         <section id="view-files" class="view">
           <section class="panel">
-            <div class="panel-heading"><div><p class="section-kicker">媒体记录</p><h2>全部文件</h2></div><p id="file-result-count" class="result-count">—</p></div>
+            <div class="panel-heading"><div><p class="section-kicker" data-i18n="files.kicker">媒体记录</p><h2 data-i18n="nav.files">全部文件</h2></div><p id="file-result-count" class="result-count">—</p></div>
             <div class="toolbar">
-              <label><span>搜索</span><input id="search-input" type="search" placeholder="文件名或原因" autocomplete="off"></label>
-              <label><span>状态</span><select id="status-filter"><option value="">全部状态</option><option value="Candidate">待修复</option><option value="QueuedRepair">等待自动修复</option><option value="QueuedRecheck">等待自动复检</option><option value="Repaired">已修复</option><option value="Healthy">正常</option><option value="Uncertain">需要人工确认</option><option value="Skipped">已跳过</option><option value="Failed">处理失败</option></select></label>
-              <label><span>格式</span><select id="format-filter"><option value="">全部格式</option><option value="mp4">MP4</option><option value="mkv">MKV</option></select></label>
+              <label><span data-i18n="search.label">搜索</span><input id="search-input" type="search" placeholder="文件名或原因" data-i18n-placeholder="search.placeholder" autocomplete="off"></label>
+              <label><span data-i18n="filter.status">状态</span><select id="status-filter"><option value="" data-i18n="filter.allStatuses">全部状态</option><option value="Candidate" data-status-label="Candidate">待修复</option><option value="QueuedRepair" data-status-label="QueuedRepair">等待自动修复</option><option value="QueuedRecheck" data-status-label="QueuedRecheck">等待自动复检</option><option value="Repaired" data-status-label="Repaired">已修复</option><option value="Healthy" data-status-label="Healthy">正常</option><option value="Uncertain" data-status-label="Uncertain">需要人工确认</option><option value="Skipped" data-status-label="Skipped">已跳过</option><option value="Failed" data-status-label="Failed">处理失败</option></select></label>
+              <label><span data-i18n="filter.format">格式</span><select id="format-filter"><option value="" data-i18n="filter.allFormats">全部格式</option><option value="mp4">MP4</option><option value="mkv">MKV</option></select></label>
             </div>
             <div id="file-results"></div>
           </section>
@@ -98,29 +99,29 @@
 
         <section id="view-tasks" class="view">
           <section class="panel">
-            <div class="panel-heading"><div><p class="section-kicker">工作队列</p><h2>任务中心</h2></div></div>
-            <div id="task-list" class="task-list"><p class="empty-cell">暂无手动任务</p></div>
+            <div class="panel-heading"><div><p class="section-kicker" data-i18n="tasks.kicker">工作队列</p><h2 data-i18n="nav.tasks">任务中心</h2></div></div>
+            <div id="task-list" class="task-list"><p class="empty-cell" data-i18n="empty.tasks">暂无手动任务</p></div>
           </section>
         </section>
 
         <section id="view-settings" class="view">
           <section class="panel settings-panel">
-            <div class="panel-heading"><div><p class="section-kicker">只读配置</p><h2>运行设置</h2></div></div>
+            <div class="panel-heading"><div><p class="section-kicker" data-i18n="settings.kicker">只读配置</p><h2 data-i18n="nav.settings">运行设置</h2></div></div>
             <dl class="config-list">
-              <div><dt>支持格式</dt><dd id="config-formats">MP4、MKV</dd></div>
-              <div><dt>自动修复</dt><dd id="config-auto-repair">—</dd></div>
-              <div><dt>MKV 时间戳修复</dt><dd id="config-mkv">—</dd></div>
-              <div><dt>每日校准</dt><dd id="config-reconcile">—</dd></div>
-              <div><dt>文件静默期</dt><dd id="config-settle">—</dd></div>
-              <div><dt>最小文件年龄</dt><dd id="config-min-age">—</dd></div>
-              <div><dt>媒体库刷新</dt><dd id="config-media-refresh">—</dd></div>
-              <div><dt>路径显示</dt><dd id="config-paths">—</dd></div>
+              <div><dt data-i18n="settings.formats">支持格式</dt><dd id="config-formats">MP4、MKV</dd></div>
+              <div><dt data-i18n="settings.autoRepair">自动修复</dt><dd id="config-auto-repair">—</dd></div>
+              <div><dt data-i18n="settings.mkv">MKV 时间戳修复</dt><dd id="config-mkv">—</dd></div>
+              <div><dt data-i18n="settings.reconcile">每日校准</dt><dd id="config-reconcile">—</dd></div>
+              <div><dt data-i18n="settings.settle">文件静默期</dt><dd id="config-settle">—</dd></div>
+              <div><dt data-i18n="settings.minAge">最小文件年龄</dt><dd id="config-min-age">—</dd></div>
+              <div><dt data-i18n="settings.mediaRefresh">媒体库刷新</dt><dd id="config-media-refresh">—</dd></div>
+              <div><dt data-i18n="settings.paths">路径显示</dt><dd id="config-paths">—</dd></div>
             </dl>
-            <p class="security-note">配置由 Docker 环境变量管理。修改后需要重新创建容器才能生效。</p>
+            <p class="security-note" data-i18n="settings.note">配置由 Docker 环境变量管理。修改后需要重新创建容器才能生效。</p>
           </section>
         </section>
       </main>
-      <footer><span>工作时自动快速刷新</span><span id="last-updated">尚未更新</span></footer>
+      <footer><span data-i18n="footer.refresh">工作时自动快速刷新</span><span id="last-updated" data-i18n="footer.never">尚未更新</span></footer>
     </div>
   </div>
   <script src="/assets/app.js" defer></script>

@@ -2,7 +2,7 @@ services:
   h264-timestamp-repair:
     build:
       context: .
-    image: local/h264-timestamp-repair:3.0.3
+    image: local/h264-timestamp-repair:3.1.0
     container_name: h264-timestamp-repair
     restart: unless-stopped
     environment:

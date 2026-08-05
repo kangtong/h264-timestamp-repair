@@ -1,12 +1,13 @@
 name: Publish container image
 
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
       version:
         description: Image version, for example 1.0.0
         required: true
-        default: 3.0.3
+        default: 3.1.0
 
 jobs:
   test:
@@ -24,10 +25,10 @@ jobs:
           mkdir -p /tmp/media
           docker compose -f docker-compose.yml config --quiet
           docker compose -f docker-compose.hub.yml config --quiet
-          docker compose -f docker-compose.watchcow.yml config --quiet
       - name: Build application image
         run: docker build -t video-integrity-repair:test .
   publish:
+    if: github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: ubuntu-latest
     permissions:
@@ -59,3 +60,12 @@ jobs:
             ${{ vars.DOCKERHUB_USERNAME }}/h264-timestamp-repair:latest
           provenance: true
           sbom: true
+
+      - name: Sync bilingual Docker Hub description
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ vars.DOCKERHUB_USERNAME }}/h264-timestamp-repair
+          short-description: "视频完整性无损修复 | Lossless video integrity repair"
+          readme-filepath: ./README.md

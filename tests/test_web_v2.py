@@ -73,6 +73,34 @@ class AnonymousWebTests(unittest.TestCase):
         self.assertEqual("正常", item["status_label"])
         self.assertEqual(200, self.get("/api/history")[0])
 
+    def test_i18n_catalogs_and_english_api_labels(self) -> None:
+        _, zh_body = self.get("/api/i18n?lang=zh-CN")
+        _, en_body = self.get("/api/i18n?lang=en")
+        zh = json.loads(zh_body)
+        en = json.loads(en_body)
+        self.assertEqual("zh-CN", zh["locale"])
+        self.assertEqual("en", en["locale"])
+        for section in ("ui", "statuses", "issues", "reasons", "stages"):
+            self.assertEqual(set(zh[section]), set(en[section]))
+
+        default_item = json.loads(self.get("/api/files")[1])["items"][0]
+        english = json.loads(self.get("/api/files?lang=en")[1])
+        self.assertEqual("正常", default_item["status_label"])
+        self.assertEqual("en", english["locale"])
+        self.assertEqual("Healthy", english["items"][0]["status_label"])
+
+    def test_heartbeat_exposes_stable_localized_stage(self) -> None:
+        heartbeat_path = self.root / "heartbeat.json"
+        payload = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+        payload.update({"current_action": "repair", "current_stage": "正在验证时间轴和媒体流"})
+        heartbeat_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        default_heartbeat = json.loads(self.get("/api/status")[1])["heartbeat"]
+        english_heartbeat = json.loads(self.get("/api/status?lang=en")[1])["heartbeat"]
+        self.assertEqual("validating_timeline_and_streams", default_heartbeat["current_stage_code"])
+        self.assertEqual("正在验证时间轴和媒体流", default_heartbeat["current_stage_label"])
+        self.assertEqual("Validating timeline and media streams", english_heartbeat["current_stage_label"])
+
     def test_manual_actions_are_persisted_and_cross_origin_is_rejected(self) -> None:
         item = json.loads(self.get("/api/files")[1])["items"][0]
         status, body = self.post("/api/files/actions/recheck", {"file_ids": [item["file_id"]]})

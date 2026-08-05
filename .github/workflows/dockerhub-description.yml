@@ -1,0 +1,27 @@
+name: Sync Docker Hub description
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - README.en.md
+      - .github/workflows/dockerhub-description.yml
+  release:
+    types: [published]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+      - name: Publish bilingual description
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ vars.DOCKERHUB_USERNAME }}/h264-timestamp-repair
+          short-description: "视频完整性无损修复 | Lossless video integrity repair"
+          readme-filepath: ./README.md

@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 
-LABEL org.opencontainers.image.title="Video Integrity Repair" \
-      org.opencontainers.image.description="Detect and losslessly repair H.264 timeline and invalid chapter metadata problems" \
+LABEL org.opencontainers.image.title="视频完整性修复 | Video Integrity Repair" \
+      org.opencontainers.image.description="检测并无损修复视频时间轴与章节元数据问题 | Detect and losslessly repair video timeline and chapter metadata issues" \
       org.opencontainers.image.source="https://github.com/kangtong/h264-timestamp-repair"
 
 ENV DEBIAN_FRONTEND=noninteractive \
