@@ -371,6 +371,10 @@ def start_web_server(
                     self._send_bytes((static_root / "style.css").read_bytes(), "text/css; charset=utf-8", cache="public,max-age=300")
                 elif path == "/assets/app.js":
                     self._send_bytes((static_root / "app.js").read_bytes(), "text/javascript; charset=utf-8", cache="public,max-age=300")
+                elif path == "/assets/icon.png":
+                    self._send_bytes((static_root / "icon.png").read_bytes(), "image/png", cache="public,max-age=86400")
+                elif path == "/assets/favicon.png":
+                    self._send_bytes((static_root / "favicon.png").read_bytes(), "image/png", cache="public,max-age=86400")
                 elif path == "/api/i18n":
                     self._send_json(catalog(locale))
                 elif path == "/api/status":
