@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -15,36 +16,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from web_i18n import ISSUE_LABELS, REASON_LABELS, STATUS_LABELS, UI, catalog, normalize_locale, stage_code, STAGE_LABELS
+
 
 LOG = logging.getLogger("timestamp-repair.web")
-
-STATUS_LABELS = {
-    "Healthy": "正常", "Candidate": "待修复", "Repaired": "已修复",
-    "Skipped": "已跳过", "Uncertain": "需要人工确认", "Failed": "处理失败",
-    "QueuedRepair": "等待自动修复", "QueuedRecheck": "等待自动复检",
-    "WaitingStable": "等待文件写入完成", "MediaRefreshQueued": "等待媒体库刷新",
-    "MediaRefreshWaiting": "等待媒体入库", "MediaRefreshDeferred": "媒体库刷新重试",
-    "MediaRefreshed": "媒体库已刷新", "Migration": "数据升级",
-}
-ISSUE_LABELS = {
-    "none": "无问题", "timeline": "时间轴异常", "chapter": "章节元数据异常",
-    "multiple": "多项异常", "unsupported": "无法自动处理", "failed": "处理失败",
-}
-REASON_LABELS = {
-    "timeline_bframe_pts": "H.264 B 帧显示时间轴顺序异常",
-    "timeline_missing_mp4": "H.264 B 帧显示时间轴顺序异常",
-    "timeline_order_mkv": "H.264 B 帧显示时间轴顺序异常",
-    "chapter_full_duration": "存在覆盖整段视频的无效空章节",
-    "timeline_and_chapter": "同时存在时间轴和章节元数据异常",
-    "timestamps_present": "显示时间戳正常", "no_b_frames": "视频不包含需要重排的 B 帧",
-    "unsupported_codec": "主视频编码不在自动修复范围内", "no_video": "没有找到主视频流",
-    "too_few_samples": "有效时间戳样本不足", "ambiguous_timeline": "抽样结果不一致，无法安全自动判断",
-    "validation_failed": "修复结果未通过完整性验证，原文件未被覆盖",
-    "variable_fps": "可变或不明确的帧率不能自动修复", "unsupported_streams": "存在无法安全复制的媒体流",
-    "repaired_timeline": "已无损重建视频显示时间戳", "repaired_chapter": "已移除无效的整段空章节",
-    "repaired_multiple": "已修复时间轴和章节元数据异常", "processing_failed": "处理过程中发生错误",
-}
-
 
 def _display_path(value: str, show_full_paths: bool) -> str:
     return value if show_full_paths else Path(value).name
@@ -82,7 +57,7 @@ def start_web_server(
     heartbeat_path = config_root / "heartbeat.json"
 
     class DashboardHandler(BaseHTTPRequestHandler):
-        server_version = "VideoIntegrityRepair/3.0.3"
+        server_version = "VideoIntegrityRepair/3.1.0"
 
         def log_message(self, format_text: str, *args: Any) -> None:
             LOG.debug("%s - %s", self.address_string(), format_text % args)
@@ -166,7 +141,7 @@ def start_web_server(
             finally:
                 connection.close()
 
-        def _heartbeat(self) -> dict[str, Any]:
+        def _heartbeat(self, locale: str) -> dict[str, Any]:
             try:
                 payload = json.loads(heartbeat_path.read_text(encoding="utf-8"))
             except (OSError, ValueError, json.JSONDecodeError):
@@ -174,10 +149,14 @@ def start_web_server(
             current = str(payload.get("current_path", ""))
             if current:
                 payload["current_path"] = _display_path(current, show_full_paths)
+            active = bool(payload.get("current_action") and payload.get("current_action") != "idle")
+            code = stage_code(str(payload.get("current_stage", "")), active)
+            payload["current_stage_code"] = code
+            payload["current_stage_label"] = STAGE_LABELS[locale].get(code, str(payload.get("current_stage", "")))
             return payload
 
-        def _status_payload(self) -> dict[str, Any]:
-            heartbeat = self._heartbeat()
+        def _status_payload(self, locale: str) -> dict[str, Any]:
+            heartbeat = self._heartbeat(locale)
             age = None
             if heartbeat.get("time") is not None:
                 try:
@@ -185,6 +164,7 @@ def start_web_server(
                 except (TypeError, ValueError):
                     age = None
             return {
+                "locale": locale,
                 "now": time.time(),
                 "heartbeat_age_seconds": age,
                 "service_healthy": age is not None and age <= 600,
@@ -193,7 +173,7 @@ def start_web_server(
                 "config": settings,
             }
 
-        def _files_payload(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        def _files_payload(self, query: dict[str, list[str]], locale: str) -> dict[str, Any]:
             status = query.get("status", [""])[0].strip()
             issue = query.get("issue", [""])[0].strip()
             container = query.get("container", [""])[0].strip()
@@ -229,7 +209,7 @@ def start_web_server(
 
             connection = self._connect()
             if connection is None:
-                return {"total": 0, "offset": offset, "limit": limit, "items": []}
+                return {"locale": locale, "total": 0, "offset": offset, "limit": limit, "items": []}
             try:
                 from_clause = " FROM files f LEFT JOIN pending p ON p.path=f.path"
                 total = int(connection.execute("SELECT COUNT(*)" + from_clause + where, params).fetchone()[0])
@@ -251,39 +231,43 @@ def start_web_server(
                         else str(item["status"])
                     )
                     item["status_code"] = effective_status
-                    item["status_label"] = STATUS_LABELS.get(effective_status, effective_status)
-                    item["issue_label"] = ISSUE_LABELS.get(str(item["issue_category"]), "其他")
-                    item["reason_label"] = REASON_LABELS.get(str(item["reason_code"]), str(item["reason"]))
+                    item["status_label"] = STATUS_LABELS[locale].get(effective_status, effective_status)
+                    item["issue_label"] = ISSUE_LABELS[locale].get(str(item["issue_category"]), ISSUE_LABELS[locale]["other"])
+                    item["reason_label"] = REASON_LABELS[locale].get(str(item["reason_code"]), str(item["reason"]))
                     try:
                         item["diagnostics"] = json.loads(str(item.pop("diagnostics_json")))
                     except (TypeError, ValueError, json.JSONDecodeError):
                         item["diagnostics"] = {}
                     items.append(item)
-                return {"total": total, "offset": offset, "limit": limit, "items": items}
+                return {"locale": locale, "total": total, "offset": offset, "limit": limit, "items": items}
             finally:
                 connection.close()
 
-        def _history_payload(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        def _history_payload(self, query: dict[str, list[str]], locale: str) -> dict[str, Any]:
             try:
                 limit = min(200, max(1, int(query.get("limit", ["30"])[0])))
             except ValueError:
                 limit = 30
             connection = self._connect()
             if connection is None:
-                return {"items": []}
+                return {"locale": locale, "items": []}
             try:
                 rows = connection.execute(
-                    "SELECT e.event_time,e.path,e.status,e.reason,p.requested_action "
-                    "FROM events e LEFT JOIN pending p ON p.path=e.path ORDER BY e.id DESC LIMIT ?",
+                    "SELECT e.event_time,e.path,e.status,e.reason,p.requested_action,f.reason_code "
+                    "FROM events e LEFT JOIN pending p ON p.path=e.path LEFT JOIN files f ON f.path=e.path "
+                    "ORDER BY e.id DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
                 return {
+                    "locale": locale,
                     "items": [
                         (lambda effective_status: {
                             "time": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(row["event_time"])),
                             "path": _display_path(str(row["path"]), show_full_paths) if row["path"] else "",
                             "status": effective_status, "reason": row["reason"],
-                            "status_label": STATUS_LABELS.get(effective_status, effective_status),
+                            "reason_code": row["reason_code"] or "",
+                            "reason_label": REASON_LABELS[locale].get(str(row["reason_code"]), str(row["reason"])),
+                            "status_label": STATUS_LABELS[locale].get(effective_status, effective_status),
                         })(
                             "QueuedRepair" if row["requested_action"] == "repair"
                             else "QueuedRecheck" if row["requested_action"] is not None
@@ -295,24 +279,39 @@ def start_web_server(
             finally:
                 connection.close()
 
-        def _tasks_payload(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        def _tasks_payload(self, query: dict[str, list[str]], locale: str) -> dict[str, Any]:
             try:
                 limit = min(200, max(1, int(query.get("limit", ["50"])[0])))
             except ValueError:
                 limit = 50
             connection = self._connect()
             if connection is None:
-                return {"items": []}
+                return {"locale": locale, "items": []}
             try:
                 rows = connection.execute(
                     "SELECT id,action,requested_at,started_at,finished_at,state,result_code,result_detail "
                     "FROM control_commands ORDER BY id DESC LIMIT ?", (limit,),
                 ).fetchall()
-                return {"items": [dict(row) for row in rows]}
+                action_keys = {"reconcile": "task.reconcile", "recheck": "task.recheck", "repair": "task.repair", "retry": "task.retry"}
+                state_keys = {"queued": "task.queued", "running": "task.running", "succeeded": "task.succeeded", "failed": "task.failed"}
+                items = []
+                for row in rows:
+                    item = dict(row)
+                    item["action_label"] = UI[locale].get(action_keys.get(str(item["action"]), ""), str(item["action"]))
+                    item["state_label"] = UI[locale].get(state_keys.get(str(item["state"]), ""), str(item["state"]))
+                    if item["result_code"] == "queued" and item["action"] == "reconcile":
+                        item["result_detail_label"] = UI[locale]["task.scanCompleted"]
+                    elif item["result_code"] == "queued":
+                        match = re.search(r"\d+", str(item["result_detail"]))
+                        item["result_detail_label"] = UI[locale]["task.filesQueued"].replace("{count}", match.group(0) if match else "0")
+                    else:
+                        item["result_detail_label"] = str(item["result_detail"])
+                    items.append(item)
+                return {"locale": locale, "items": items}
             finally:
                 connection.close()
 
-        def _file_payload(self, file_id: str) -> dict[str, Any] | None:
+        def _file_payload(self, file_id: str, locale: str) -> dict[str, Any] | None:
             connection = self._connect()
             if connection is None:
                 return None
@@ -332,9 +331,10 @@ def start_web_server(
                     else str(item["status"])
                 )
                 item["status_code"] = effective_status
-                item["status_label"] = STATUS_LABELS.get(effective_status, effective_status)
-                item["issue_label"] = ISSUE_LABELS.get(str(item["issue_category"]), "其他")
-                item["reason_label"] = REASON_LABELS.get(str(item["reason_code"]), str(item["reason"]))
+                item["locale"] = locale
+                item["status_label"] = STATUS_LABELS[locale].get(effective_status, effective_status)
+                item["issue_label"] = ISSUE_LABELS[locale].get(str(item["issue_category"]), ISSUE_LABELS[locale]["other"])
+                item["reason_label"] = REASON_LABELS[locale].get(str(item["reason_code"]), str(item["reason"]))
                 try:
                     item["diagnostics"] = json.loads(str(item.pop("diagnostics_json")))
                 except (TypeError, ValueError, json.JSONDecodeError):
@@ -364,41 +364,51 @@ def start_web_server(
                 parsed = urlparse(self.path)
                 path = parsed.path
                 query = parse_qs(parsed.query, keep_blank_values=True)
+                locale = normalize_locale(query.get("lang", [""])[0])
                 if path in {"/", "/index.html"}:
                     self._send_bytes((static_root / "index.html").read_bytes(), "text/html; charset=utf-8", cache="no-cache")
                 elif path == "/assets/style.css":
                     self._send_bytes((static_root / "style.css").read_bytes(), "text/css; charset=utf-8", cache="public,max-age=300")
                 elif path == "/assets/app.js":
                     self._send_bytes((static_root / "app.js").read_bytes(), "text/javascript; charset=utf-8", cache="public,max-age=300")
+                elif path == "/api/i18n":
+                    self._send_json(catalog(locale))
                 elif path == "/api/status":
-                    self._send_json(self._status_payload())
+                    self._send_json(self._status_payload(locale))
                 elif path == "/api/files":
-                    self._send_json(self._files_payload(query))
+                    self._send_json(self._files_payload(query, locale))
                 elif path == "/api/history":
-                    self._send_json(self._history_payload(query))
+                    self._send_json(self._history_payload(query, locale))
                 elif path == "/api/tasks":
-                    self._send_json(self._tasks_payload(query))
+                    self._send_json(self._tasks_payload(query, locale))
                 elif path.startswith("/api/files/"):
-                    payload = self._file_payload(path.rsplit("/", 1)[-1])
-                    self._send_json(payload if payload is not None else {"error": "文件记录不存在"}, HTTPStatus.OK if payload else HTTPStatus.NOT_FOUND)
+                    payload = self._file_payload(path.rsplit("/", 1)[-1], locale)
+                    message = "文件记录不存在" if locale == "zh-CN" else "File record not found"
+                    self._send_json(payload if payload is not None else {"locale": locale, "error": message}, HTTPStatus.OK if payload else HTTPStatus.NOT_FOUND)
                 else:
-                    self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                    message = "接口不存在" if locale == "zh-CN" else "Endpoint not found"
+                    self._send_json({"locale": locale, "error": message}, HTTPStatus.NOT_FOUND)
             except (OSError, sqlite3.Error, ValueError) as exc:
                 LOG.exception("Dashboard request failed")
                 self._send_json({"error": "dashboard data is temporarily unavailable"}, HTTPStatus.SERVICE_UNAVAILABLE)
 
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            locale = "zh-CN"
             try:
+                parsed = urlparse(self.path)
+                locale = normalize_locale(parse_qs(parsed.query).get("lang", [""])[0])
                 origin = self.headers.get("Origin", "")
                 if origin and urlparse(origin).netloc != self.headers.get("Host", ""):
-                    self._send_json({"error": "拒绝跨站请求"}, HTTPStatus.FORBIDDEN)
+                    message = "拒绝跨站请求" if locale == "zh-CN" else "Cross-origin request rejected"
+                    self._send_json({"locale": locale, "error": message}, HTTPStatus.FORBIDDEN)
                     return
                 if "application/json" not in self.headers.get("Content-Type", ""):
-                    self._send_json({"error": "请求必须使用 JSON"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                    message = "请求必须使用 JSON" if locale == "zh-CN" else "The request must use JSON"
+                    self._send_json({"locale": locale, "error": message}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
                     return
                 length = min(64 * 1024, max(0, int(self.headers.get("Content-Length", "0"))))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                path = urlparse(self.path).path
+                path = parsed.path
                 actions = {
                     "/api/actions/reconcile": "reconcile",
                     "/api/files/actions/recheck": "recheck",
@@ -407,20 +417,24 @@ def start_web_server(
                 }
                 action = actions.get(path)
                 if action is None:
-                    self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                    message = "接口不存在" if locale == "zh-CN" else "Endpoint not found"
+                    self._send_json({"locale": locale, "error": message}, HTTPStatus.NOT_FOUND)
                     return
                 file_ids = [] if action == "reconcile" else [str(v) for v in payload.get("file_ids", []) if str(v)]
                 if action != "reconcile" and not file_ids:
-                    self._send_json({"error": "请选择至少一个文件"}, HTTPStatus.BAD_REQUEST)
+                    message = "请选择至少一个文件" if locale == "zh-CN" else "Select at least one file"
+                    self._send_json({"locale": locale, "error": message}, HTTPStatus.BAD_REQUEST)
                     return
                 if len(file_ids) > 100:
-                    self._send_json({"error": "单次最多操作 100 个文件"}, HTTPStatus.BAD_REQUEST)
+                    message = "单次最多操作 100 个文件" if locale == "zh-CN" else "A single action can include at most 100 files"
+                    self._send_json({"locale": locale, "error": message}, HTTPStatus.BAD_REQUEST)
                     return
                 command_id = self._queue_command(action, file_ids)
-                self._send_json({"accepted": True, "command_id": command_id}, HTTPStatus.ACCEPTED)
+                self._send_json({"locale": locale, "accepted": True, "command_id": command_id}, HTTPStatus.ACCEPTED)
             except (OSError, sqlite3.Error, ValueError, json.JSONDecodeError) as exc:
                 LOG.exception("Dashboard control request failed")
-                self._send_json({"error": str(exc) or "操作暂时不可用"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                message = "操作暂时不可用" if locale == "zh-CN" else "The action is temporarily unavailable"
+                self._send_json({"locale": locale, "error": message}, HTTPStatus.SERVICE_UNAVAILABLE)
 
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     server.daemon_threads = True
