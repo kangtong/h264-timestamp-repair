@@ -1,6 +1,6 @@
 services:
   h264-timestamp-repair:
-    image: ${DOCKER_IMAGE:-kangtong1993/h264-timestamp-repair:3.0.2}
+    image: ${DOCKER_IMAGE:-kangtong1993/h264-timestamp-repair:3.0.3}
     pull_policy: always
     container_name: h264-timestamp-repair
     restart: unless-stopped

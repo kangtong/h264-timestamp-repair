@@ -22,6 +22,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -705,6 +706,44 @@ def packet_payload_fingerprints(path: Path, info: dict[str, Any]) -> dict[str, t
     return {key: (counts[key], digests[key].hexdigest()) for key in sorted(digests)}
 
 
+def copied_payload_fingerprints(
+    fingerprints: dict[str, tuple[int, str]],
+    container: str,
+) -> dict[str, tuple[int, str]]:
+    """Keep payloads the remux path promises to copy; reject non-empty dropped MP4 data."""
+    if container != "mp4":
+        return fingerprints
+    copied: dict[str, tuple[int, str]] = {}
+    for key, value in fingerprints.items():
+        stream_type = key.split(":", 1)[0]
+        if stream_type in {"audio", "subtitle"}:
+            copied[key] = value
+        elif int(value[0]) > 0:
+            raise RepairValidationError(
+                f"MP4 {stream_type} stream contains packet payloads that cannot be dropped safely"
+            )
+    return copied
+
+
+def mp4box_fps(value: Any, duration: float) -> str:
+    """Bound pathological FPS fractions without materially changing total duration."""
+    try:
+        numerator_text, denominator_text = str(value).split("/", 1)
+        original = Fraction(int(numerator_text), int(denominator_text))
+    except (ValueError, ZeroDivisionError):
+        return str(value)
+    if original <= 0:
+        return str(value)
+    if abs(original.numerator) <= 1_000_000 and original.denominator <= 100_000:
+        return f"{original.numerator}/{original.denominator}"
+    for maximum_denominator in (1_000, 10_000, 100_000, 1_000_000):
+        candidate = original.limit_denominator(maximum_denominator)
+        duration_drift = max(0.0, duration) * abs(float(original / candidate) - 1.0)
+        if duration_drift <= 0.005:
+            return f"{candidate.numerator}/{candidate.denominator}"
+    return f"{original.numerator}/{original.denominator}"
+
+
 def assert_free_space(input_size: int) -> None:
     required = int(input_size * (3.2 if KEEP_TEMP_ON_FAILURE else 2.25) + 1024**3)
     free = shutil.disk_usage(WORK_ROOT).free
@@ -866,9 +905,12 @@ def repair_one(path: Path, original: Analysis) -> tuple[str, int]:
     success = False
     try:
         report_task("正在记录非视频流指纹", stage_progress=None, overall_progress=2.0)
-        original_payloads = packet_payload_fingerprints(path, original.info)
+        original_payloads = copied_payload_fingerprints(
+            packet_payload_fingerprints(path, original.info), original.container,
+        )
         if original.timestamp_issue:
             nominal_fps = str(original.video.get("r_frame_rate") or original.video.get("avg_frame_rate"))
+            rebuild_fps = mp4box_fps(nominal_fps, duration)
             LOG.info("Extracting H.264 without re-encoding: %s", path)
             run_ffmpeg_progress(
                 [
@@ -900,7 +942,7 @@ def repair_one(path: Path, original: Analysis) -> tuple[str, int]:
             LOG.info("Rebuilding composition timestamps: %s", path)
             report_task("正在重建显示时间戳", stage_progress=None, overall_progress=30.0)
             run_logged(
-                [MP4BOX, "-tmp", str(job), "-add", f"{raw}:fps={nominal_fps}", "-new", str(video_only)],
+                [MP4BOX, "-tmp", str(job), "-add", f"{raw}:fps={rebuild_fps}", "-new", str(video_only)],
                 job / "mp4box",
                 "MP4Box timestamp rebuild",
             )
@@ -971,7 +1013,10 @@ def repair_one(path: Path, original: Analysis) -> tuple[str, int]:
                 raise RepairValidationError("修复前后的 H.264 参数 NAL 内容不一致")
         report_task("正在验证时间轴和媒体流", stage_progress=None, overall_progress=78.0)
         fixed = analyze(repaired)
-        if packet_payload_fingerprints(repaired, fixed.info) != original_payloads:
+        repaired_payloads = copied_payload_fingerprints(
+            packet_payload_fingerprints(repaired, fixed.info), fixed.container,
+        )
+        if repaired_payloads != original_payloads:
             raise RepairValidationError("A copied non-video stream packet payload changed unexpectedly")
         compare_streams(original, fixed)
         duration = float(fixed.info.get("format", {}).get("duration", 0.0) or 0.0)
@@ -1997,7 +2042,7 @@ def main() -> int:
             LOG.exception("Web UI failed to start; repair service will continue without it")
 
     LOG.info(
-        "Service 3.0.2 started: media=%s auto_repair=%s mkv_timestamps=%s empty_full_chapters=%s media_refresh=%s reconcile=%s",
+        "Service 3.0.3 started: media=%s auto_repair=%s mkv_timestamps=%s empty_full_chapters=%s media_refresh=%s reconcile=%s",
         MEDIA_ROOT, AUTO_REPAIR, REPAIR_MKV_TIMESTAMPS, REPAIR_EMPTY_FULL_CHAPTERS,
         media_refresh_client is not None, RECONCILE_LOCAL_TIME,
     )
