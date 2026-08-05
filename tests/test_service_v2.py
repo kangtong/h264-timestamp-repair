@@ -258,6 +258,28 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(before_fingerprint, reordered_fingerprint)
         self.assertNotEqual(before_fingerprint["vcl"], changed_fingerprint["vcl"])
 
+    def test_empty_mp4_data_placeholder_does_not_require_manual_review(self) -> None:
+        fingerprints = {
+            "audio:0": (100, "audio-hash"),
+            "data:0": (0, "empty-hash"),
+        }
+        self.assertEqual(
+            {"audio:0": (100, "audio-hash")},
+            service.copied_payload_fingerprints(fingerprints, "mp4"),
+        )
+        self.assertEqual(fingerprints, service.copied_payload_fingerprints(fingerprints, "mkv"))
+        with self.assertRaisesRegex(service.RepairValidationError, "cannot be dropped safely"):
+            service.copied_payload_fingerprints({"data:0": (1, "payload-hash")}, "mp4")
+
+    def test_pathological_fps_fraction_is_safely_bounded(self) -> None:
+        original = service.Fraction(681753313, 27716001)
+        normalized = service.mp4box_fps("681753313/27716001", 988.420767)
+        self.assertEqual("2263/92", normalized)
+        candidate = service.Fraction(normalized)
+        duration_drift = 988.420767 * abs(float(original / candidate) - 1.0)
+        self.assertLessEqual(duration_drift, 0.005)
+        self.assertEqual("30000/1001", service.mp4box_fps("30000/1001", 7200.0))
+
     def test_mp4_and_mkv_use_the_same_timeline_issue_code(self) -> None:
         info = self.media_info_with_chapter(title="valid", start=5.0, end=80.0)
         for name in ("sample.mp4", "sample.mkv"):

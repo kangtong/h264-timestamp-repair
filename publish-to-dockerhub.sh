@@ -12,7 +12,7 @@ if [[ -z "${DOCKERHUB_TOKEN}" ]]; then
 fi
 
 REPOSITORY="${DOCKERHUB_REPOSITORY:-h264-timestamp-repair}"
-VERSION="${IMAGE_VERSION:-3.0.2}"
+VERSION="${IMAGE_VERSION:-3.0.3}"
 IMAGE="docker.io/${DOCKERHUB_USERNAME}/${REPOSITORY}"
 
 printf '%s' "${DOCKERHUB_TOKEN}" | docker login --username "${DOCKERHUB_USERNAME}" --password-stdin
