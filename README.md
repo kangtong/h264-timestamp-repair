@@ -2,6 +2,8 @@
 
 [English documentation](https://github.com/kangtong/h264-timestamp-repair/blob/main/README.en.md)
 
+<p align="center"><img src="https://raw.githubusercontent.com/kangtong/h264-timestamp-repair/main/app/web/icon.png" width="128" alt="Video Integrity Repair icon"></p>
+
 一个面向 Docker 和 Linux 的通用服务，用于检测并无损修复 H.264 B 帧时间轴异常及无效章节元数据。视频和音频均不重新编码。
 
 ## 支持的问题

@@ -1,5 +1,7 @@
 # Video Integrity Repair
 
+<p align="center"><img src="https://raw.githubusercontent.com/kangtong/h264-timestamp-repair/main/app/web/icon.png" width="128" alt="Video Integrity Repair icon"></p>
+
 [中文文档](https://github.com/kangtong/h264-timestamp-repair/blob/main/README.md)
 
 A general-purpose Docker and Linux service that detects and losslessly repairs H.264 B-frame timeline errors and invalid chapter metadata. Video and audio are never re-encoded.

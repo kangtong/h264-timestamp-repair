@@ -12,6 +12,14 @@ from web_i18n import UI  # noqa: E402
 
 
 class StaticWebTests(unittest.TestCase):
+    def test_project_icon_assets_and_references_are_present(self) -> None:
+        html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
+        css = (WEB_ROOT / "style.css").read_text(encoding="utf-8")
+        self.assertIn('/assets/favicon.png', html)
+        self.assertIn('/assets/icon.png', css)
+        self.assertGreater((WEB_ROOT / "icon.png").stat().st_size, 0)
+        self.assertGreater((WEB_ROOT / "favicon.png").stat().st_size, 0)
+
     def test_chinese_menu_and_manual_controls_are_present(self) -> None:
         html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
         for label in ("概览", "问题文件", "全部文件", "任务中心", "运行设置"):
