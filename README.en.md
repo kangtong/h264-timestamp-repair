@@ -26,6 +26,12 @@ MP4 and MKV share the same timeline-integrity core. The final decision is based 
 - Atomically replaces the original only after timeline, bitstream hash, stream-property, and sample-decode validation pass.
 - Web API exposes stable status, reason, and task-stage codes with Chinese or English labels.
 
+### Version 3.1.1
+
+- Fixed invalid empty full-duration chapter detection for long videos by allowing a small bounded stream-tail duration difference without misclassifying normal chapters.
+- On startup, only MP4 files previously repaired for timeline issues with dropped data tracks are rechecked; no full-library rescan is triggered.
+- After removing an invalid chapter, the service still asks the media server to replace and regenerate chapter images automatically.
+
 ### Version 3.1.0
 
 - The public project now contains only generic Docker deployment files, with no device- or platform-specific configuration.
@@ -47,7 +53,7 @@ Create `.env`:
 
 ```dotenv
 MEDIA_HOST_PATH=/srv/media
-DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:3.1.0
+DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:3.1.1
 TZ=Asia/Shanghai
 AUTO_REPAIR=false
 REPAIR_MKV_TIMESTAMPS=true

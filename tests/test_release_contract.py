@@ -42,7 +42,7 @@ class ReleaseContractTests(unittest.TestCase):
         ):
             content = (ROOT / relative).read_text(encoding="utf-8")
             if relative != "Dockerfile":
-                self.assertIn("3.1.0", content, relative)
+                self.assertIn("3.1.1", content, relative)
 
 
 if __name__ == "__main__":

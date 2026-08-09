@@ -26,6 +26,12 @@ MP4 和 MKV 使用同一个时间轴完整性核心：最终依据是解码后�
 - 修复完成并通过时间轴、码流哈希、流属性和抽样解码校验后才原子替换原文件。
 - Web API 提供稳定的状态、原因和任务阶段代码，并返回中文或英文标签。
 
+### 3.1.1
+
+- 修正长视频中“空白且覆盖完整时长”的无效章节识别：允许音视频流尾部存在很小的合理时长差，同时设置严格上限，避免误判正常章节。
+- 启动后只定向复查曾修复时间轴且丢弃过数据轨的 MP4，不触发媒体库全量重扫。
+- 删除无效章节后继续自动通知媒体服务器替换并重新生成章节图像。
+
 ### 3.1.0
 
 - 公共项目只保留通用 Docker 部署，不包含任何设备或平台专用配置。
@@ -47,7 +53,7 @@ curl -O https://raw.githubusercontent.com/kangtong/h264-timestamp-repair/main/do
 
 ```dotenv
 MEDIA_HOST_PATH=/srv/media
-DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:3.1.0
+DOCKER_IMAGE=kangtong1993/h264-timestamp-repair:3.1.1
 TZ=Asia/Shanghai
 AUTO_REPAIR=false
 REPAIR_MKV_TIMESTAMPS=true
