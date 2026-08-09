@@ -105,6 +105,36 @@ class StateTests(unittest.TestCase):
         pending = self.state.db.execute("SELECT requested_action FROM pending WHERE path=?", (str(media),)).fetchone()
         self.assertEqual("repair", pending["requested_action"])
 
+    def test_chapter_tolerance_backfill_targets_only_prior_matching_repairs(self) -> None:
+        affected = self.root / "affected.mp4"
+        unaffected = self.root / "unaffected.mp4"
+        affected.write_bytes(b"affected")
+        unaffected.write_bytes(b"unaffected")
+        analysis = service.Analysis(
+            "Repaired", "timeline", {"streams": []}, {"codec_name": "h264"},
+            container="mp4", issue_category="timeline", reason_code="repaired_timeline",
+        )
+        self.state.save(
+            affected, affected.stat(), "Repaired", "timeline repaired",
+            dropped_data=1, analysis=analysis,
+        )
+        self.state.save(
+            unaffected, unaffected.stat(), "Repaired", "timeline repaired",
+            dropped_data=0, analysis=analysis,
+        )
+
+        self.assertEqual(1, self.state.backfill_chapter_tolerance_rechecks())
+        row = self.state.db.execute("SELECT * FROM pending").fetchone()
+        self.assertEqual(str(affected), row["path"])
+        self.assertEqual("chapter-rule-upgrade", row["event_kind"])
+        self.assertEqual(1, row["force"])
+        self.assertEqual("inspect", row["requested_action"])
+
+        self.state.db.execute("DELETE FROM pending")
+        self.state.db.commit()
+        self.assertEqual(0, self.state.backfill_chapter_tolerance_rechecks())
+        self.assertEqual(0, self.state.pending_count())
+
 
 class MigrationTests(unittest.TestCase):
     def test_legacy_migration_preserves_valid_cache_and_requeues_failure(self) -> None:
@@ -153,9 +183,11 @@ class MigrationTests(unittest.TestCase):
 
 class UtilityTests(unittest.TestCase):
     @staticmethod
-    def media_info_with_chapter(*, title: str = "", start: float = 0.0, end: float = 100.0) -> dict:
+    def media_info_with_chapter(
+        *, title: str = "", start: float = 0.0, end: float = 100.0, duration: float = 100.0,
+    ) -> dict:
         return {
-            "format": {"duration": "100.0"},
+            "format": {"duration": str(duration)},
             "streams": [{
                 "codec_type": "video", "codec_name": "h264", "has_b_frames": 1,
                 "profile": "High", "width": 1920, "height": 1080, "pix_fmt": "yuv420p",
@@ -175,6 +207,14 @@ class UtilityTests(unittest.TestCase):
         multiple = self.media_info_with_chapter()
         multiple["chapters"].append(dict(multiple["chapters"][0]))
         self.assertFalse(service.has_empty_full_duration_chapter(multiple))
+
+    def test_detects_long_file_chapter_ending_at_shorter_stream_duration(self) -> None:
+        self.assertTrue(service.has_empty_full_duration_chapter(self.media_info_with_chapter(
+            duration=7116.850184, end=7115.029,
+        )))
+        self.assertFalse(service.has_empty_full_duration_chapter(self.media_info_with_chapter(
+            duration=7116.850184, end=7100.0,
+        )))
 
     def test_analysis_reports_timestamp_and_chapter_problems_independently(self) -> None:
         info = self.media_info_with_chapter()

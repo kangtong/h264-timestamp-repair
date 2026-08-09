@@ -335,7 +335,11 @@ def has_empty_full_duration_chapter(info: dict[str, Any]) -> bool:
     if duration <= 0:
         return False
     title = str((chapters[0].get("tags") or {}).get("title", "")).strip()
-    tolerance = max(0.1, duration * 0.00001)
+    # MP4 chapter metadata can end at the shortest media stream while the
+    # container duration includes a slightly longer video tail. Accept a
+    # small relative tail difference, but cap it so a genuinely shorter
+    # chapter is never mistaken for the synthetic full-file chapter.
+    tolerance = max(0.1, min(5.0, duration * 0.001))
     return not title and abs(start) <= 0.05 and abs(end - duration) <= tolerance
 
 
@@ -1227,6 +1231,34 @@ class State:
             WAKE_EVENT.set()
         return added
 
+    def backfill_chapter_tolerance_rechecks(self) -> int:
+        """Recheck only prior MP4 timeline repairs that may retain a bogus chapter."""
+        marker = "chapter_tolerance_backfill_v1"
+        if self.meta_get(marker) == "complete":
+            return 0
+        now = time.time()
+        self.db.execute(
+            """
+            INSERT OR IGNORE INTO pending(
+              path,event_kind,queued_at,eligible_at,force,attempts,requested_action
+            )
+            SELECT path,'chapter-rule-upgrade',?,?,1,0,'inspect' FROM files
+            WHERE container='mp4' AND status='Repaired'
+              AND reason_code='repaired_timeline' AND dropped_data>0
+            """,
+            (now, now),
+        )
+        added = int(self.db.execute("SELECT changes()").fetchone()[0])
+        self.db.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (marker, "complete"),
+        )
+        self.db.commit()
+        if added:
+            WAKE_EVENT.set()
+        return added
+
     def record(self, path: Path, status: str, reason: str) -> None:
         self.db.execute(
             "INSERT INTO events(event_time,path,status,reason) VALUES(?,?,?,?)",
@@ -1995,6 +2027,9 @@ def main() -> int:
     ACTIVE_RUNTIME = runtime
     media_refresh_client = EmbyRefreshClient.from_environment(MEDIA_ROOT)
     runtime.media_refresh_enabled = media_refresh_client is not None
+    chapter_rechecks = state.backfill_chapter_tolerance_rechecks()
+    if chapter_rechecks:
+        LOG.info("Queued %d prior MP4 repairs for targeted chapter recheck", chapter_rechecks)
     if media_refresh_client is not None:
         backfilled = state.backfill_chapter_media_refreshes()
         if backfilled:
@@ -2042,7 +2077,7 @@ def main() -> int:
             LOG.exception("Web UI failed to start; repair service will continue without it")
 
     LOG.info(
-        "Service 3.1.0 started: media=%s auto_repair=%s mkv_timestamps=%s empty_full_chapters=%s media_refresh=%s reconcile=%s",
+        "Service 3.1.1 started: media=%s auto_repair=%s mkv_timestamps=%s empty_full_chapters=%s media_refresh=%s reconcile=%s",
         MEDIA_ROOT, AUTO_REPAIR, REPAIR_MKV_TIMESTAMPS, REPAIR_EMPTY_FULL_CHAPTERS,
         media_refresh_client is not None, RECONCILE_LOCAL_TIME,
     )
